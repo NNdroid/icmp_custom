@@ -1,0 +1,186 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (gofmt + vet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - name: gofmt (no diff allowed)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Files need gofmt:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+
+  test:
+    name: Test (${{ matrix.os }}, ${{ matrix.go }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        go: ['1.26.x', 'stable']
+        exclude:
+          - os: macos-latest
+            go: 'stable'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+      - name: Build
+        run: go build -v ./...
+      # The full suite runs on the in-memory fake transport by design, so no
+      # root / CAP_NET_RAW is needed anywhere in CI.
+      - name: Test (race + coverage)
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race -count=1 -coverprofile=coverage.txt -covermode=atomic ./... 2>&1 | tee test-output.txt
+      - name: Upload test output (always, for post-mortem)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ matrix.os }}-${{ matrix.go }}
+          path: test-output.txt
+          if-no-files-found: ignore
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}-${{ matrix.go }}
+          path: coverage.txt
+          if-no-files-found: error
+
+  bench-smoke:
+    name: Benchmark smoke
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+      # -benchtime 1x: run every benchmark once just to prove it executes and
+      # does not panic or hang. Real numbers come from the nightly/bench job.
+      - name: Run benchmarks (single iteration each)
+        run: go test -run '^$' -bench . -benchtime 1x ./...
+
+  cross-build:
+    name: Cross build (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          # The Android ping-socket carrier (P9) must keep compiling.
+          - { goos: android, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - name: Build
+        run: go build -trimpath ./...
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+      # For Android, also compile the TEST files: the ping-socket carrier's
+      # unit tests carry the android build tag and cannot run without a
+      # device, but a compile failure must still break CI.
+      - name: Vet (compiles tests too)
+        if: matrix.goos == 'android'
+        run: go vet ./...
+        env:
+          GOOS: android
+          GOARCH: arm64
+
+  android-emulator:
+    name: Android emulator (ping socket on a real kernel)
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # android/amd64 needs external (cgo) linking; the runner image ships
+      # the NDK, so we point CGO's CC at its clang wrapper.
+      ANDROID_TEST_BIN: tunnel-android.test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+
+      - name: Enable KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Build android/amd64 test binary (cgo + NDK)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-/usr/local/lib/android/sdk/ndk-bundle}"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CC="$TOOLCHAIN/x86_64-linux-android24-clang" \
+          CGO_ENABLED=1 GOOS=android GOARCH=amd64 \
+            go test -c -trimpath -o "$ANDROID_TEST_BIN" ./tunnel/
+
+      # The emulator IS a real Android kernel: the ping-socket carrier's
+      # device-gated tests (openPingSocket + protectFD ordering, loopback
+      # round trip, the ping_group_range self-check against the real sysctl)
+      # and the host-portable ping tests all execute here for real.
+      - name: Run tests on the emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          script: |
+            adb root
+            adb wait-for-device
+            adb push "$ANDROID_TEST_BIN" /data/local/tmp/
+            adb shell chmod 755 /data/local/tmp/"$ANDROID_TEST_BIN"
+            # /bin/sh (dash) here has no pipefail; capture the binary's own
+            # exit code instead of teeing through a pipe.
+            adb shell /data/local/tmp/"$ANDROID_TEST_BIN" \
+              -test.run 'TestDevicePing|TestPing|TestCheckPingGroupRange|TestParsePingGroupRange|TestSelfFsgid' \
+              -test.timeout 10m -test.v > android-test.log 2>&1
+            code=$?
+            cat android-test.log
+            exit $code
+
+      - name: Upload android test output (always, for post-mortem)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-output
+          path: android-test.log
+          if-no-files-found: ignore
