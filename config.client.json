@@ -1,0 +1,42 @@
+{
+  "log_level": "info",
+
+  // The peer to tunnel to. ICMP binds no port, so a bare host is natural;
+  // "host:port" is accepted and the port ignored.
+  "server": "203.0.113.7",
+
+  // The endpoint requested from the server. Leave empty for its default.
+  "target": "tcp://127.0.0.1:22",
+
+  // Must match the server's PSK. Use a HIGH-ENTROPY secret; short or
+  // human-guessable values are brute-forceable online.
+  "passwords": ["CHANGE-ME"],
+
+  // Optional: the server's Noise public key (from `gen-keys`). Empty =
+  // PSK-only mode: still confidential, without forward secrecy.
+  "server_pub": "",
+
+  // Local address applications connect to.
+  "listen": "127.0.0.1:1080",
+
+  "magic": 0,
+  "send_window": 256,
+
+  // The ICMP path often has a higher RTT and may be rate-limited.
+  "handshake_attempts": 8,
+  "handshake_backoff_ms": 400,
+
+  "icmp": {
+    "max_payload": 1200,
+    "mtu_mode": "probe",
+    "mtu_min": 548,
+    "mtu_step": 100,
+    "pace_ms": 20,
+    "id_range": "",
+    "probe": true,
+    "polls_in_flight": 4,    // the downlink throughput ceiling (~ window / RTT)
+    "idle_poll_ms": 1000,
+    "keepalive_ms": 15000,
+    "block_timeout": "60s"
+  }
+}

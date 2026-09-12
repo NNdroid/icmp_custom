@@ -412,3 +412,47 @@ func TestE2EConcurrentTunnels(t *testing.T) {
 		}
 	}
 }
+
+// A server accepts ANY of its PSKs and the client offers its list in order,
+// one full attempt phase each. This is what makes a credential rotation
+// self-healing: the stale PSK first in the list gets no answer, the fresh one
+// behind it comes up — before this loop existed the client offered only
+// Passwords[0] and such a config failed silently.
+func TestE2EClientOffersEachConfiguredPSKInTurn(t *testing.T) {
+	backend, stop := tcpEchoServer(t)
+	defer stop()
+
+	cEp, _, _ := newTestServer(t, ServerConfig{
+		TargetAddr: "tcp://" + backend,
+		Passwords:  []string{"fresh-psk"},
+	}, nil)
+	cli := newTestClient(t, ClientConfig{
+		ServerAddr: "192.0.2.2",
+		Passwords:  []string{"stale-psk", "fresh-psk"},
+		// One quick attempt per credential keeps the stale phase short; the
+		// production defaults (8 attempts, growing backoff) apply per phase.
+		HandshakeAttempts: 1,
+		HandshakeBackoff:  5 * time.Millisecond,
+	}, cEp)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := cli.DialTunnel(ctx, DialOptions{})
+	if err != nil {
+		t.Fatalf("DialTunnel: %v", err)
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	want := []byte("rotation survivor")
+	if _, err := conn.Write(want); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("echo = %q, want %q", got, want)
+	}
+}

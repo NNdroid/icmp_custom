@@ -27,10 +27,6 @@ const maxWireRecordSize = RecordHdrSize + MaxPayloadLen + RecordTagSize
 // port. `encoding/json` ignores unknown keys, so a config file carrying them is
 // accepted without being read (see DESIGN_ICMP.md §0).
 type ServerConfig struct {
-	// Transport names the carrier. Only "icmp" exists in this project; an
-	// empty value selects it. Any other value is rejected at construction
-	// time by NewServer, before a socket is opened.
-	Transport string `json:"transport"`
 	// ICMP is the ICMP carrier profile. Its zero value is exactly the
 	// documented default profile, so an omitted `icmp` object means
 	// "defaults". It is read by NewServer, not by NewServerWithTransport,
@@ -38,6 +34,11 @@ type ServerConfig struct {
 	ICMP ICMPProfile `json:"icmp"`
 	// TargetAddr is the default forwarding endpoint, e.g. "tcp://127.0.0.1:22"
 	// or "udp://10.0.0.5:51820". An endpoint without a scheme is TCP.
+	//
+	// Endpoint strings exchanged in the handshake ride the wire MAC-protected
+	// but IN PLAINTEXT: a passive observer learns which endpoint a session
+	// forwards to. Keeping that metadata dull is the cheap mitigation; hiding
+	// it needs a protocol revision that encrypts the handshake.
 	TargetAddr string `json:"target"`
 	// Passwords are the accepted PSKs. At least one non-blank is mandatory:
 	// there is no open/unauthenticated mode.
@@ -54,6 +55,12 @@ type ServerConfig struct {
 	// port; the network must match exactly. An empty list means only the
 	// default TargetAddr is reachable — every client request is silently
 	// denied, exactly like any other handshake failure.
+	//
+	// A pattern WITHOUT an explicit port matches every port on the hosts it
+	// names: "tcp://10.0.0.*" grants all TCP ports there, loopback and
+	// cloud-metadata addresses included. Spell the port out ("tcp://*:22") to
+	// stay narrow; NewServerWithTransport warns about portless patterns so the
+	// widening is never silent.
 	//
 	// To use the handshake-time MTU probe (mtu_mode "probe"), allow
 	// "discard://*" here; see DESIGN_ICMP.md §4.8 option A'.
@@ -215,8 +222,15 @@ func NewServerWithTransport(cfg ServerConfig, tr Transport, dial TargetDialer) (
 			continue
 		}
 		_, rest := ParseTargetNetworkAndAddr(p)
-		if _, _, err := net.SplitHostPort(rest); err != nil && !strings.ContainsAny(rest, "*?") {
-			logger.Warnf("[Server] allowed_targets pattern %q looks malformed (no port and no wildcard) and will never match", p)
+		if _, _, err := net.SplitHostPort(rest); err != nil {
+			if strings.ContainsAny(rest, "*?") {
+				// "tcp://10.0.0.*" grants every TCP port on the matching hosts,
+				// loopback and cloud-metadata addresses included. The widening
+				// is legitimate when intended, but it must never be silent.
+				logger.Warnf("[Server] allowed_targets pattern %q has no explicit port and therefore matches EVERY port on the hosts it names; spell the port out (e.g. %q) unless that is intended", p, p+":22")
+			} else {
+				logger.Warnf("[Server] allowed_targets pattern %q looks malformed (no port and no wildcard) and will never match", p)
+			}
 		}
 	}
 	return srv, nil
@@ -714,6 +728,12 @@ func (s *Server) emitSessionEvent(ev SessionEvent) { s.events.emit(ev) }
 // pattern. Both sides use ParseTargetNetworkAndAddr semantics: the network
 // (tcp/udp) must be equal, and the host:port part is matched with '*' (any
 // sequence) and '?' (one character) wildcards, case-insensitively on the host.
+//
+// The whole-string fallback below is load-bearing and deliberate: a pattern
+// whose host:port part has no port ("tcp://10.0.0.*") is matched as a whole
+// against the endpoint, which grants EVERY port on the matching hosts. That is
+// why NewServerWithTransport warns about portless patterns — the widening must
+// never be a surprise.
 func matchTargetPattern(pattern, endpoint string) bool {
 	pNet, pRest := ParseTargetNetworkAndAddr(pattern)
 	eNet, eRest := ParseTargetNetworkAndAddr(endpoint)
@@ -926,19 +946,41 @@ func (c *synCache) Len() int {
 }
 
 // synLimiter is a per-source-IP token bucket that throttles SYNs. A source IP
-// gets `burst` tokens refilled at `rate` per second; when the map grows past
-// 1024 buckets, long-idle ones are pruned.
+// gets `burst` tokens refilled at `rate` per second; the bucket table is
+// FAIL-CLOSED at synBucketCap: idle buckets are pruned first, and a brand-new
+// source is refused (never admitted with a fresh bucket) while the table stays
+// full. Growing the table without bound would let a spoofed-source SYN flood —
+// which needs no credential, because the limiter runs before MAC verification
+// — turn the only per-packet allocation an attacker can drive into a slow
+// remote memory DoS. Under such a flood, refusing unknown sources is the right
+// trade: sources that were already talking keep their buckets, and the flood
+// cannot evict them to reset their own budget.
+//
+// Note what this gate cannot do: a distributed source-rotating flood still
+// gets one burst of MAC verifications per bucket it manages to claim. That is
+// inherent to pre-authentication rate limiting; the per-IP bucket is the cheap
+// first gate, and HKDF-SHA256 is microseconds.
 type synLimiter struct {
-	mu      sync.Mutex
-	buckets map[string]*synBucket
-	rate    float64
-	burst   float64
+	mu       sync.Mutex
+	buckets  map[string]*synBucket
+	rate     float64
+	burst    float64
+	rejected uint64 // new sources refused while the table was full after pruning
 }
 
 type synBucket struct {
 	tokens float64
 	last   time.Time
 }
+
+const (
+	// synBucketCap bounds the bucket table. 1024 concurrent sources is far
+	// above any legitimate deployment's handshake concurrency.
+	synBucketCap = 1024
+	// synBucketIdleTTL is how long an untouched bucket is kept before pruning
+	// makes room for new sources.
+	synBucketIdleTTL = time.Minute
+)
 
 func newSynLimiter(ratePerSec, burst float64) *synLimiter {
 	if ratePerSec <= 0 {
@@ -956,12 +998,18 @@ func (l *synLimiter) Allow(ip string, now time.Time) bool {
 	defer l.mu.Unlock()
 	b, ok := l.buckets[ip]
 	if !ok {
-		if len(l.buckets) >= 1024 {
+		if len(l.buckets) >= synBucketCap {
 			for k, ob := range l.buckets {
-				if now.Sub(ob.last) > time.Minute {
+				if now.Sub(ob.last) > synBucketIdleTTL {
 					delete(l.buckets, k)
 				}
 			}
+		}
+		if len(l.buckets) >= synBucketCap {
+			// The table is full of live buckets: refuse the unknown source
+			// rather than grow. Fail-closed is the point.
+			l.rejected++
+			return false
 		}
 		b = &synBucket{tokens: l.burst, last: now}
 		l.buckets[ip] = b
@@ -976,6 +1024,14 @@ func (l *synLimiter) Allow(ip string, now time.Time) bool {
 	}
 	b.tokens--
 	return true
+}
+
+// Rejected reports how many new sources were refused because the table was
+// full after pruning — the flood signature of a spoofed-source SYN storm.
+func (l *synLimiter) Rejected() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.rejected
 }
 
 // Len returns the number of tracked source IPs (used by tests).

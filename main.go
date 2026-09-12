@@ -84,7 +84,6 @@ Notes:
     variables, no default paths. Unknown JSON keys are ignored.
   * The raw ICMP carrier needs CAP_NET_RAW. Prefer the capability over root:
         sudo setcap cap_net_raw+ep $(command -v icmp_custom)
-  * This build implements only the "icmp" transport.
 `)
 }
 

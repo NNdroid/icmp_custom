@@ -1,0 +1,40 @@
+{
+  "log_level": "info",
+
+  // The default forwarding endpoint for clients that request none.
+  // Use "discard://" (and allow it below) to enable the MTU probe.
+  "target": "tcp://127.0.0.1:22",
+
+  // Accepted PSKs. At least one is mandatory; there is no open mode.
+  // `psk` and `password` are accepted as aliases. Use a
+  // HIGH-ENTROPY secret (e.g. `openssl rand -base64 24`); short or
+  // human-guessable values are brute-forceable online, and there is no
+  // second factor.
+  "passwords": ["CHANGE-ME"],
+
+  // Optional: enables Noise_NK forward secrecy. Generate with `gen-keys`.
+  "privkey": "",
+
+  // Client-requested endpoints that will be granted. Patterns take '*' and
+  // '?'. An empty list means only "target" above is reachable.
+  // Add "discard://*" to allow the client's MTU probe.
+  "allowed_targets": [],
+
+  // Record magic. Leave 0 for the default, or generate one with `gen-magic`
+  // and use the SAME value on both ends. Not a security boundary: it is a
+  // cheap prefilter, chosen to avoid a string fingerprint.
+  "magic": 0,
+
+  "send_window": 256,
+
+  "icmp": {
+    "max_payload": 1200,     // start and hard ceiling of the MTU search
+    "mtu_mode": "probe",     // probe | auto (in-band only) | fixed
+    "mtu_min": 548,          // never step below (IPv4 reassembly floor)
+    "mtu_step": 100,         // upward step, halved near the ceiling
+    "pace_ms": 20,           // spaces outbound packets; both ends need it
+    "id_range": "",          // e.g. "1000-1999"; empty = a fresh id per packet
+    "probe": true,           // server-initiated reverse probe (best-effort)
+    "block_timeout": "60s"   // how long a fully blocked carrier is tolerated
+  }
+}

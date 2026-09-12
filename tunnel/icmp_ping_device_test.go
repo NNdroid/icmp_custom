@@ -51,8 +51,9 @@ func TestDevicePingSocketOpenCallsProtectBeforeTraffic(t *testing.T) {
 	// protect must have happened BEFORE any traffic: send the first probe
 	// and verify the error counter stayed at zero (the callback had no
 	// failures) and the kernel assigned an ident. sendEcho consults the
-	// parent pingICMP for the socket table, so wire up a minimal one.
-	p := &pingICMP{socks: []*pingSocket{s}}
+	// parent pingICMP for the socket table, so wire up a minimal one — with
+	// the real sockPort hook, because the ident is read back through it.
+	p := &pingICMP{socks: []*pingSocket{s}, sockPort: unixSockPort}
 	s.parent = p
 	if err := s.parent.sendEcho([]byte("probe"), loopbackAddrPort(), 0x1234, 1); err != nil {
 		t.Fatalf("sendEcho on the real socket: %v", err)

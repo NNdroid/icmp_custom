@@ -288,8 +288,8 @@ func TestRunServerCarrierFailureCarriesAnActionableHint(t *testing.T) {
 func TestRunServerReportsAnInvalidConfigWithAConfigHint(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "server.json")
-	// A valid transport and a bad profile value: the failure is the config.
-	bad := `{"transport":"icmp","target":"tcp://127.0.0.1:22","passwords":["x"],"icmp":{"max_payload":99999}}`
+	// A bad profile value: the failure is the config, not the platform.
+	bad := `{"target":"tcp://127.0.0.1:22","passwords":["x"],"icmp":{"max_payload":99999}}`
 	if err := os.WriteFile(path, []byte(bad), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -302,21 +302,5 @@ func TestRunServerReportsAnInvalidConfigWithAConfigHint(t *testing.T) {
 	}
 	if !strings.Contains(errb, "max_payload") {
 		t.Fatalf("the error should name the offending field:\n%s", errb)
-	}
-}
-
-func TestRunRejectsAnUnsupportedTransportWithAConfigHint(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "server.json")
-	bad := `{"transport":"udp","target":"tcp://127.0.0.1:22","passwords":["x"]}`
-	if err := os.WriteFile(path, []byte(bad), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	code, _, errb := runCLI(t, "server", "-c", path)
-	if code != 1 {
-		t.Fatalf("exit = %d, want 1 (stderr=%q)", code, errb)
-	}
-	if !strings.Contains(errb, "udp") || !strings.Contains(errb, "icmp") {
-		t.Fatalf("the error should name both the bad value and the accepted one:\n%s", errb)
 	}
 }

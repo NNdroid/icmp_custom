@@ -212,20 +212,6 @@ func TestClientStartSurfacesAListenFailure(t *testing.T) {
 }
 
 func TestProfileDefaultConstructorsFailLoudly(t *testing.T) {
-	// A transport name this build does not implement is a configuration
-	// mistake and must name the accepted value, on both endpoints.
-	_, err := NewServerWithDialer(ServerConfig{Transport: "udp", Passwords: []string{"k"}}, nil)
-	if err == nil || !errors.Is(err, ErrConfigRequired) {
-		t.Fatalf("NewServerWithDialer(transport=udp) = %v, want ErrConfigRequired", err)
-	}
-	if !strings.Contains(err.Error(), TransportICMP) {
-		t.Fatalf("transport error %v must name the accepted transport", err)
-	}
-	_, err = NewClient(ClientConfig{Transport: "udp", ServerAddr: "192.0.2.2", Passwords: []string{"k"}})
-	if err == nil || !errors.Is(err, ErrConfigRequired) {
-		t.Fatalf("NewClient(transport=udp) = %v, want ErrConfigRequired", err)
-	}
-
 	// On this platform the ICMP carrier itself must refuse to open (either no
 	// raw-socket capability or no such support at all) — and it must refuse
 	// BEFORE the session layer is built, leaving nothing half-open.
@@ -234,15 +220,15 @@ func TestProfileDefaultConstructorsFailLoudly(t *testing.T) {
 	}
 
 	// The peer is validated before any socket is touched.
-	_, err = NewClient(ClientConfig{ServerAddr: "not an address", Passwords: []string{"k"}})
+	_, err := NewClient(ClientConfig{ServerAddr: "not an address", Passwords: []string{"k"}})
 	if err == nil || !strings.Contains(err.Error(), "invalid 'server'") {
 		t.Fatalf("NewClient(bad server) = %v, want an 'invalid server' error", err)
 	}
 
 	// A malformed ICMP profile is rejected at construction, not at first poll.
-	_, err = NewClient(ClientConfig{ServerAddr: "192.0.2.2", Passwords: []string{"k"}, ICMP: ICMPProfile{Family: "sneaky"}})
+	_, err = NewClient(ClientConfig{ServerAddr: "192.0.2.2", Passwords: []string{"k"}, ICMP: ICMPProfile{MTUMode: "sneaky"}})
 	if err == nil {
-		t.Fatal("NewClient with an unknown ICMP family must fail")
+		t.Fatal("NewClient with an unknown ICMP mtu_mode must fail")
 	}
 }
 

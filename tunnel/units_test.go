@@ -179,7 +179,7 @@ func TestPokeBookTracksOutstandingPolls(t *testing.T) {
 }
 
 func TestICMPCoreMTUHelpers(t *testing.T) {
-	resolved, err := (ICMPProfile{Family: "ipv4", MaxPayload: 1472, MTUMode: "probe", PaceMS: 1}).resolve()
+	resolved, err := (ICMPProfile{MaxPayload: 1452, MTUMode: "probe", PaceMS: 1}).resolve()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestICMPCoreMTUHelpers(t *testing.T) {
 		t.Fatalf("budget after noteSendTooLarge = %d, want 1200 (1300 - step)", got)
 	}
 
-	fixed, err := (ICMPProfile{Family: "ipv4", MaxPayload: 1472, MTUMode: "fixed", PaceMS: 1}).resolve()
+	fixed, err := (ICMPProfile{MaxPayload: 1452, MTUMode: "fixed", PaceMS: 1}).resolve()
 	if err != nil {
 		t.Fatal(err)
 	}

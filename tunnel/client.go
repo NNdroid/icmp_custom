@@ -50,10 +50,6 @@ const (
 // (`port_range` / `origdst` / `sendsock_max` / `receive_sockets`) simply do not
 // exist here; unknown JSON keys are ignored.
 type ClientConfig struct {
-	// Transport names the carrier. Only "icmp" exists in this project; an
-	// empty value selects it. Any other value is rejected by NewClient before
-	// a socket is opened.
-	Transport string `json:"transport"`
 	// ICMP is the ICMP carrier profile (and the source of the poll schedule,
 	// which on a request-driven carrier IS the downlink throughput ceiling).
 	// Read by NewClient, not by NewClientWithTransport.
@@ -66,8 +62,18 @@ type ClientConfig struct {
 	// "tcp://127.0.0.1:22". Empty asks for the server's default target. The
 	// server only honors requests that pass its allowed_targets filter; a
 	// denied request means the handshake never completes.
+	//
+	// Note the endpoint strings exchanged in the handshake (this one and the
+	// granted echo) are MAC-protected but IN PLAINTEXT on the wire: a passive
+	// observer learns which endpoint a session forwards to. Keeping the
+	// requested metadata dull is the cheap mitigation.
 	Target string `json:"target"`
-	// Passwords are the PSKs; at least one non-blank is mandatory.
+	// Passwords are the PSKs; at least one non-blank is mandatory. They are
+	// OFFERED IN ORDER: the server accepts any of its configured PSKs, and the
+	// client runs one full handshake-attempt phase per credential, so a
+	// rotation window (stale PSK first, fresh PSK second) self-heals. Use a
+	// high-entropy secret; short or guessable values are brute-forceable
+	// online.
 	Passwords []string `json:"passwords"`
 	// Magic must match the server's. Zero selects MagicDefault.
 	Magic uint32 `json:"magic"`
@@ -598,19 +604,42 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 
 // handshake sends the SYN (retransmitting until the ACK arrives) and returns
 // the new SessionID, the record protection, and the target the server actually
-// granted ("" for the server's default). The request rides inside the MAC'd SYN
-// payload; a server that does not allow it silently drops the SYN, which
-// surfaces here as "no handshake ACK". Retransmissions reuse the exact SYN, so
-// the server's nonce cache answers with the exact same ACK and session.
+// granted ("" for the server's default).
+//
+// The configured PSKs are offered IN ORDER, one full attempt phase each: a
+// server accepts any of its PSKs, so a client whose list spans a credential
+// rotation (stale first, fresh second) comes up as soon as one matches. With
+// the common single-PSK config this loop degenerates to one phase. A phase
+// that ends in ErrHandshakeTimeout means THIS credential got no answer and the
+// next one is tried; any other error (closed, cancelled, protocol failure)
+// aborts immediately.
 func (c *Client) handshake(ctx context.Context, target string) (uint32, *FrameKeys, string, error) {
 	if len(target) > TargetMaxLen {
 		return 0, nil, "", fmt.Errorf("target %q exceeds %d bytes", target, TargetMaxLen)
 	}
+	for _, psk := range c.cfg.Passwords {
+		sid, keys, granted, err := c.handshakeWithPSK(ctx, target, psk)
+		if err == nil {
+			return sid, keys, granted, nil
+		}
+		if !errors.Is(err, ErrHandshakeTimeout) {
+			return 0, nil, "", err
+		}
+	}
+	return 0, nil, "", fmt.Errorf("%w (check: peer reachable? same PSK on both ends? requested target allowed by the peer's allowed_targets? — denied requests are silently dropped)", ErrHandshakeTimeout)
+}
+
+// handshakeWithPSK runs one full attempt phase with a single PSK. It returns
+// ErrHandshakeTimeout when every attempt timed out — the caller's cue to try
+// the next credential.
+func (c *Client) handshakeWithPSK(ctx context.Context, target, psk string) (uint32, *FrameKeys, string, error) {
 	var nk *ClientNK
 	var msg1 []byte
 	var zero [32]byte
 	encrypted := c.cfg.ServerPub != zero
 	if encrypted {
+		// A fresh ephemeral per credential: a failed Finish must not carry
+		// half-mixed transcript state into the next attempt.
 		var err error
 		nk, err = NewClientNK(c.cfg.ServerPub)
 		if err != nil {
@@ -626,7 +655,7 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *FrameKe
 	if _, err := rand.Read(clientNonce[:]); err != nil {
 		return 0, nil, "", fmt.Errorf("nonce: %w", err)
 	}
-	handshakeKeys := DerivePSKHandshakeKeys(c.cfg.Passwords[0], clientNonce)
+	handshakeKeys := DerivePSKHandshakeKeys(psk, clientNonce)
 
 	// [16B ClientNonce] [8B Timestamp] [target TLV] [optional 48B msg1].
 	payload := make([]byte, SynPayloadBase)
@@ -685,7 +714,7 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *FrameKe
 				var serverNonce [ServerNonceSize]byte
 				copy(serverNonce[:], ack.Data[ClientNonceSize:AckPayloadBase])
 				if !encrypted {
-					keys := DerivePSKSessionKeys(c.cfg.Passwords[0], clientNonce, serverNonce, ack.SessionID)
+					keys := DerivePSKSessionKeys(psk, clientNonce, serverNonce, ack.SessionID)
 					frameKeys, err := keys.ClientFrameCiphers()
 					if err != nil {
 						timer.Stop()
@@ -717,7 +746,9 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *FrameKe
 			}
 		}
 	}
-	return 0, nil, "", fmt.Errorf("%w (check: peer reachable? same PSK on both ends? requested target allowed by the peer's allowed_targets? — denied requests are silently dropped)", ErrHandshakeTimeout)
+	// This credential got no answer within its attempt budget. The handshake
+	// caller decides whether another PSK gets a turn or the hints are shown.
+	return 0, nil, "", ErrHandshakeTimeout
 }
 
 // sendHandshakeRecord transmits a pre-encoded handshake record. On a

@@ -2,7 +2,6 @@ package tunnel
 
 import (
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -14,43 +13,15 @@ import (
 // so `main.go` (and any embedder that does not own sockets itself) can build a
 // working Server or Client from configuration alone.
 //
-// The rule it enforces: a transport that cannot exist must fail loudly at
-// construction time, never silently at the first packet. That covers three
+// The rule it enforces: a carrier that cannot exist must fail loudly at
+// construction time, never silently at the first packet. That covers two
 // distinct failures, each with its own actionable message —
 //
-//  1. an unsupported transport NAME ("udp" in a project with no UDP profile);
-//  2. an unsupported PLATFORM (a raw ICMP carrier on Windows/macOS);
-//  3. missing privileges (no CAP_NET_RAW) or a ping socket outside
+//  1. an unsupported PLATFORM (a raw ICMP carrier on Windows/macOS);
+//  2. missing privileges (no CAP_NET_RAW) or a ping socket outside
 //     net.ipv4.ping_group_range.
 //
-// (2) and (3) are raised by newPlatformICMPTransport, which knows the platform;
-// (1) is raised here.
-
-// TransportICMP is the transport profile this project implements. There is no
-// UDP profile: `udp_custom` owns that, and a config that still says "udp" is a
-// mistake, not a silent fallback to ICMP.
-const TransportICMP = "icmp"
-
-// resolveTransport validates and normalises a configured transport name. An
-// empty value means "the only one there is", i.e. ICMP.
-//
-// The rejection deliberately names the accepted value: a config carried over
-// from a UDP deployment should tell the operator what this build actually
-// speaks instead of dying later with a socket error that looks unrelated.
-func resolveTransport(name string) (string, error) {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "", TransportICMP:
-		return TransportICMP, nil
-	}
-	return "", fmt.Errorf("%w: transport = %q (this build implements only %q)",
-		ErrConfigRequired, name, TransportICMP)
-}
-
-// CheckTransport validates a configured transport name without opening
-// anything. It is the exported half of resolveTransport, for a CLI that wants
-// to reject a bad `transport` value while validating the whole config, before
-// any socket exists.
-func CheckTransport(name string) (string, error) { return resolveTransport(name) }
+// Both are raised by newPlatformICMPTransport, which knows the platform.
 
 // NewServer builds a server on the ICMP carrier described by cfg, with a plain
 // out-dial for forwarding targets.
@@ -67,9 +38,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 // already-open carrier is closed, because a raw ICMP socket is a real kernel
 // resource and leaking one per misconfiguration is not acceptable.
 func NewServerWithDialer(cfg ServerConfig, dial TargetDialer) (*Server, error) {
-	if _, err := resolveTransport(cfg.Transport); err != nil {
-		return nil, err
-	}
 	logger := resolveLogger(cfg.Logger, cfg.LogLevel)
 	tr, err := newICMPServerTransport(cfg.ICMP, logger)
 	if err != nil {
@@ -93,9 +61,6 @@ func NewServerWithDialer(cfg ServerConfig, dial TargetDialer) (*Server, error) {
 // ClientConfig by hand is not surprised; the CLI path leaves them zero and
 // gets the profile's values verbatim.
 func NewClient(cfg ClientConfig) (*Client, error) {
-	if _, err := resolveTransport(cfg.Transport); err != nil {
-		return nil, err
-	}
 	// Validate the peer before touching a socket: an unparseable or missing
 	// 'server' must not leave a raw socket half-open.
 	peer, err := parsePeerAddr(cfg.ServerAddr)
