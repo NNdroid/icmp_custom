@@ -35,9 +35,6 @@ import (
 //     nanoseconds. Explicit projection makes the JSON vocabulary and the Go
 //     types agree by construction.
 type Config struct {
-	// Transport names the carrier: "icmp" (default, and the only one). An
-	// empty value selects it.
-	Transport string `json:"transport"`
 	// LogLevel is debug|info|warn|error.
 	LogLevel string `json:"log_level"`
 	// ICMP is the ICMP carrier profile. Its zero value is the documented
@@ -244,7 +241,6 @@ func stripJSONComments(raw []byte) []byte {
 // list of blank strings must fail in the same place a missing list does.
 func (c *Config) ServerConfig() (tunnel.ServerConfig, error) {
 	sc := tunnel.ServerConfig{
-		Transport:      c.Transport,
 		ICMP:           c.ICMP,
 		TargetAddr:     strings.TrimSpace(c.Target),
 		Passwords:      mergePasswords(c.Passwords),
@@ -263,9 +259,6 @@ func (c *Config) ServerConfig() (tunnel.ServerConfig, error) {
 	if err := c.ICMP.Validate(); err != nil {
 		return sc, err
 	}
-	if _, err := tunnel.CheckTransport(c.Transport); err != nil {
-		return sc, err
-	}
 	return sc, nil
 }
 
@@ -273,7 +266,6 @@ func (c *Config) ServerConfig() (tunnel.ServerConfig, error) {
 // fields the client role cannot run without.
 func (c *Config) ClientConfig() (tunnel.ClientConfig, error) {
 	cc := tunnel.ClientConfig{
-		Transport:         c.Transport,
 		ICMP:              c.ICMP,
 		ServerAddr:        strings.TrimSpace(c.Server),
 		Target:            strings.TrimSpace(c.Target),
@@ -304,9 +296,6 @@ func (c *Config) ClientConfig() (tunnel.ClientConfig, error) {
 		cc.ServerPub = key
 	}
 	if err := c.ICMP.Validate(); err != nil {
-		return cc, err
-	}
-	if _, err := tunnel.CheckTransport(c.Transport); err != nil {
 		return cc, err
 	}
 	return cc, nil

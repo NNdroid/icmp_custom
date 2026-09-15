@@ -40,21 +40,14 @@ func TestParseConfigAppliesDocumentedDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseConfig: %v", err)
 	}
-	if cfg.Transport != "" {
-		t.Fatalf("Transport = %q, want empty (means icmp)", cfg.Transport)
-	}
 	// The zero ICMPProfile must be the documented default profile, so an
 	// omitted block is indistinguishable from an explicit default one.
 	if err := cfg.ICMP.Validate(); err != nil {
 		t.Fatalf("the implicit default profile must validate: %v", err)
 	}
 
-	sc, err := cfg.ServerConfig()
-	if err != nil {
+	if _, err := cfg.ServerConfig(); err != nil {
 		t.Fatalf("ServerConfig: %v", err)
-	}
-	if name, err := tunnel.CheckTransport(sc.Transport); err != nil || name != tunnel.TransportICMP {
-		t.Fatalf("CheckTransport(%q) = %q, %v; want icmp", sc.Transport, name, err)
 	}
 }
 
@@ -170,6 +163,9 @@ func TestParseConfigIgnoresForeignUDPKeys(t *testing.T) {
 	raw := `{
   "target": "tcp://127.0.0.1:22",
   "passwords": ["secret"],
+  // A config carried over from a UDP deployment may still name the transport;
+  // there is exactly one carrier, so the key is ignored like any other.
+  "transport": "udp",
   "port_range": "20000-20100",
   "origdst": true,
   "sendsock_max": 64,
@@ -274,19 +270,6 @@ func TestClientConfigParsesServerPub(t *testing.T) {
 		t.Fatal("a malformed server_pub was accepted")
 	} else if !errors.Is(err, tunnel.ErrBadKey) {
 		t.Fatalf("error %v does not wrap ErrBadKey", err)
-	}
-}
-
-func TestConfigRejectsUnsupportedTransport(t *testing.T) {
-	if _, err := (&Config{
-		Transport: "udp", Target: "tcp://127.0.0.1:22", Passwords: []string{"secret"},
-	}).ServerConfig(); !errors.Is(err, tunnel.ErrConfigRequired) {
-		t.Fatalf("server: error %v, want ErrConfigRequired", err)
-	}
-	if _, err := (&Config{
-		Transport: "udp", Server: "203.0.113.7", Listen: "127.0.0.1:1080", Passwords: []string{"secret"},
-	}).ClientConfig(); !errors.Is(err, tunnel.ErrConfigRequired) {
-		t.Fatalf("client: error %v, want ErrConfigRequired", err)
 	}
 }
 

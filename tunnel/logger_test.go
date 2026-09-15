@@ -92,8 +92,9 @@ func TestStdLoggerFiltersByLevel(t *testing.T) {
 			}
 			for i, prefix := range tc.want {
 				// The prefix is padded to DEBUG's width, so match on the name
-				// rather than on the exact bracket contents.
-				if !strings.Contains(lines[i], prefix) || !strings.HasPrefix(lines[i], "[") {
+				// rather than on the exact bracket contents; the head emoji is
+				// the first thing on every line.
+				if !strings.Contains(lines[i], prefix) || !strings.HasPrefix(lines[i], levelEmoji(prefix)) {
 					t.Fatalf("line %d = %q, want the %s prefix", i, lines[i], prefix)
 				}
 			}
@@ -233,5 +234,42 @@ func TestCaptureLoggerHelperIsReusableAcrossGoroutines(t *testing.T) {
 	defer l.mu.Unlock()
 	if len(l.lines) != 8 {
 		t.Fatalf("captured %d lines, want 8", len(l.lines))
+	}
+}
+
+// TestStdLoggerLevelEmojiPinsTheHeaderFormat pins the two properties the
+// decoration was designed around: every line leads with its level emoji, and
+// the "[LEVEL]" grep anchor survives byte-identical behind it.
+func TestStdLoggerLevelEmojiPinsTheHeaderFormat(t *testing.T) {
+	lines := asLogLines(t, func() {
+		l := stdLogger{level: LogLevelDebug}
+		l.Debugf("a")
+		l.Infof("b")
+		l.Warnf("c")
+		l.Errorf("d")
+	})
+	want := []string{
+		"🔍 [DEBUG] a",
+		"🟢 [INFO ] b",
+		"🟡 [WARN ] c",
+		"🔴 [ERROR] d",
+	}
+	if len(lines) != len(want) {
+		t.Fatalf("got %d lines, want %d: %q", len(lines), len(want), lines)
+	}
+	for i, w := range want {
+		if !strings.HasSuffix(lines[i], w) {
+			t.Fatalf("line %d = %q, want suffix %q", i, lines[i], w)
+		}
+	}
+
+	// The alignment guarantee: all four emoji must be the same UTF-8 byte
+	// length, otherwise the message column shifts per line and the padded
+	// level word no longer aligns anything.
+	n := len(levelEmoji("DEBUG"))
+	for _, lvl := range []string{"INFO", "WARN", "ERROR"} {
+		if got := len(levelEmoji(lvl)); got != n {
+			t.Fatalf("levelEmoji(%q) is %d bytes, want %d (unequal lengths break the message column)", lvl, got, n)
+		}
 	}
 }

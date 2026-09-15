@@ -188,9 +188,6 @@ func TestICMPProfileDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the zero profile must resolve: %v", err)
 	}
-	if got.family != familyAuto {
-		t.Fatalf("family = %v, want auto", got.family)
-	}
 	if got.maxPayload != icmpDefaultMaxPayload {
 		t.Fatalf("max_payload = %d, want %d", got.maxPayload, icmpDefaultMaxPayload)
 	}
@@ -227,15 +224,15 @@ func TestICMPProfileDefaults(t *testing.T) {
 func TestICMPProfileAcceptsExplicitValues(t *testing.T) {
 	probe := false
 	got, err := (ICMPProfile{
-		Family: "ipv6", MaxPayload: 1400, MTUMode: "fixed", MTUMin: 600, MTUStep: 32,
+		MaxPayload: 1400, MTUMode: "fixed", MTUMin: 600, MTUStep: 32,
 		PaceMS: 7, IDRange: "1000-1999", Probe: &probe, PollsInFlight: 2,
 		IdlePollMS: 250, KeepAliveMS: 5000, BlockTimeout: "30s",
 	}).resolve()
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if got.family != familyV6 || got.maxPayload != 1400 || got.mtuMode != mtuFixed {
-		t.Fatalf("family/max/mode = %v/%d/%v", got.family, got.maxPayload, got.mtuMode)
+	if got.maxPayload != 1400 || got.mtuMode != mtuFixed {
+		t.Fatalf("max/mode = %d/%v", got.maxPayload, got.mtuMode)
 	}
 	if got.mtuMin != 600 || got.mtuStep != 32 {
 		t.Fatalf("mtu_min/step = %d/%d", got.mtuMin, got.mtuStep)
@@ -262,12 +259,12 @@ func TestICMPProfileRejectsInvalid(t *testing.T) {
 		prof    ICMPProfile
 		wantSub string
 	}{
-		{"family", ICMPProfile{Family: "ipv5"}, "icmp.family"},
 		{"max_payload below floor", ICMPProfile{MaxPayload: 100}, "icmp.max_payload"},
-		{"max_payload v4 ceiling", ICMPProfile{Family: "ipv4", MaxPayload: 1473}, "icmp.max_payload"},
-		{"max_payload v6 ceiling", ICMPProfile{Family: "ipv6", MaxPayload: 1453}, "icmp.max_payload"},
-		{"max_payload auto uses v6 ceiling", ICMPProfile{Family: "auto", MaxPayload: 1453}, "icmp.max_payload"},
-		{"max_payload 1472 is fine for v4", ICMPProfile{Family: "ipv4", MaxPayload: 1472}, ""},
+		// One family-independent ceiling now: the dual-stack safe one (IPv6's).
+		// There is no `family` to widen it for, so 1453 is rejected for everyone
+		// and 1452 is the largest accepted value.
+		{"max_payload one over the ceiling", ICMPProfile{MaxPayload: 1453}, "icmp.max_payload"},
+		{"max_payload at the ceiling", ICMPProfile{MaxPayload: 1452}, ""},
 		{"mtu_mode", ICMPProfile{MTUMode: "maybe"}, "icmp.mtu_mode"},
 		{"mtu_min below floor", ICMPProfile{MTUMin: 400}, "icmp.mtu_min"},
 		{"mtu_min above max_payload", ICMPProfile{MaxPayload: 700, MTUMin: 800}, "icmp.mtu_min"},
@@ -308,16 +305,12 @@ func TestICMPProfileRejectsInvalid(t *testing.T) {
 	}
 }
 
-func TestBudgetBoundsPerFamily(t *testing.T) {
-	if lo, hi := budgetBounds(familyV4); lo != icmpMinPayload || hi != icmpV4MaxPayload {
-		t.Fatalf("v4 bounds = %d..%d", lo, hi)
-	}
-	if lo, hi := budgetBounds(familyV6); lo != icmpMinPayload || hi != icmpV6MaxPayload {
-		t.Fatalf("v6 bounds = %d..%d", lo, hi)
-	}
-	// auto must satisfy BOTH families, so its ceiling is the smaller of the two.
-	if _, hi := budgetBounds(familyAuto); hi != icmpV6MaxPayload {
-		t.Fatalf("auto ceiling = %d, want the v6 ceiling %d", hi, icmpV6MaxPayload)
+func TestBudgetBoundsIsFamilyIndependent(t *testing.T) {
+	// With no `family` knob, the single ceiling is the dual-stack safe one: IPv6's
+	// 1452, since a server binds both families and a v4-only budget would make
+	// the IPv6 half oversized.
+	if lo, hi := budgetBounds(); lo != icmpMinPayload || hi != icmpV6MaxPayload {
+		t.Fatalf("budget bounds = %d..%d, want %d..%d", lo, hi, icmpMinPayload, icmpV6MaxPayload)
 	}
 }
 
@@ -1052,14 +1045,14 @@ func TestParseTargetNetworkAndAddrRecognisesDiscard(t *testing.T) {
 
 func TestICMPTransportPublishesLiveBudgetAndFixedReceiveCeiling(t *testing.T) {
 	tr, _ := newTestICMPTransport(t, ICMPProfile{
-		Family: "ipv4", MaxPayload: 1472, MTUMode: "auto", PaceMS: 1,
+		MaxPayload: 1452, MTUMode: "auto", PaceMS: 1,
 	}, Nop{})
 
 	if got := tr.MaxRecordSize(); got != icmpDefaultMaxPayload {
 		t.Fatalf("initial send budget = %d, want %d", got, icmpDefaultMaxPayload)
 	}
-	if got := tr.MaxReceiveSize(); got != 1472 {
-		t.Fatalf("receive ceiling = %d, want the configured 1472", got)
+	if got := tr.MaxReceiveSize(); got != 1452 {
+		t.Fatalf("receive ceiling = %d, want the configured 1452", got)
 	}
 	for i := 0; i < mtuAcksToGrow; i++ {
 		tr.RecordAcked(tr.MaxRecordSize())
@@ -1067,14 +1060,14 @@ func TestICMPTransportPublishesLiveBudgetAndFixedReceiveCeiling(t *testing.T) {
 	if got := tr.MaxRecordSize(); got != icmpDefaultMaxPayload+100 {
 		t.Fatalf("send budget after acks = %d, want 1300", got)
 	}
-	if got := tr.MaxReceiveSize(); got != 1472 {
-		t.Fatalf("receive ceiling followed the send budget to %d; it must stay 1472", got)
+	if got := tr.MaxReceiveSize(); got != 1452 {
+		t.Fatalf("receive ceiling followed the send budget to %d; it must stay 1452", got)
 	}
 }
 
 func TestICMPTransportAdoptsAnInbandPathBudget(t *testing.T) {
 	tr, plat := newTestICMPTransport(t, ICMPProfile{
-		Family: "ipv4", MaxPayload: 1472, MTUMode: "auto", PaceMS: 1,
+		MaxPayload: 1452, MTUMode: "auto", PaceMS: 1,
 	}, Nop{})
 
 	// A frag-needed report carries no record; the reader must adopt it and keep
@@ -1097,7 +1090,7 @@ func TestICMPTransportAdoptsAnInbandPathBudget(t *testing.T) {
 
 func TestICMPTransportSkipsBareEchoesButCountsThem(t *testing.T) {
 	tr, plat := newTestICMPTransport(t, ICMPProfile{
-		Family: "ipv4", MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
+		MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
 	}, Nop{})
 
 	// An inbound Echo Request with no record is the peer's keepalive: nothing to
@@ -1120,7 +1113,7 @@ func TestICMPTransportSkipsBareEchoesButCountsThem(t *testing.T) {
 
 func TestICMPTransportOversizeSendShrinksTheBudget(t *testing.T) {
 	tr, plat := newTestICMPTransport(t, ICMPProfile{
-		Family: "ipv4", MaxPayload: 1472, MTUMode: "auto", PaceMS: 1,
+		MaxPayload: 1452, MTUMode: "auto", PaceMS: 1,
 	}, Nop{})
 
 	plat.setSendErr(fmt.Errorf("%w: the kernel refused it", ErrRecordTooLarge))
@@ -1135,7 +1128,7 @@ func TestICMPTransportOversizeSendShrinksTheBudget(t *testing.T) {
 
 func TestICMPTransportPokeAndPollStatsAttributeReplies(t *testing.T) {
 	tr, plat := newTestICMPTransport(t, ICMPProfile{
-		Family: "ipv4", MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
+		MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
 	}, Nop{})
 
 	seq, err := tr.Poke([]byte("ping"), testICMPPeer)
@@ -1168,7 +1161,7 @@ func TestICMPTransportPokeAndPollStatsAttributeReplies(t *testing.T) {
 // the session-facing interface onto the shared controller.
 func TestICMPTransportForwardsBothMTUFeedbackDirections(t *testing.T) {
 	tr, _ := newTestICMPTransport(t, ICMPProfile{
-		Family: "ipv4", MaxPayload: 1472, MTUMode: "auto", PaceMS: 1,
+		MaxPayload: 1452, MTUMode: "auto", PaceMS: 1,
 	}, Nop{})
 
 	// Grow on acknowledged full-budget records...
@@ -1190,7 +1183,7 @@ func TestICMPTransportForwardsBothMTUFeedbackDirections(t *testing.T) {
 func TestICMPTransportRetiresTheReverseProbeAfterRepeatedFailure(t *testing.T) {
 	log := &captureLogger{}
 	tr, plat := newTestICMPTransport(t, ICMPProfile{
-		Family: "ipv4", MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
+		MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
 	}, log)
 	plat.setSendErr(errors.New("send refused"))
 
@@ -1211,7 +1204,7 @@ func TestICMPTransportRetiresTheReverseProbeAfterRepeatedFailure(t *testing.T) {
 func TestICMPTransportProbeCanBeDisabledByProfile(t *testing.T) {
 	off := false
 	tr, _ := newTestICMPTransport(t, ICMPProfile{
-		Family: "ipv4", MaxPayload: 1200, MTUMode: "auto", PaceMS: 1, Probe: &off,
+		MaxPayload: 1200, MTUMode: "auto", PaceMS: 1, Probe: &off,
 	}, Nop{})
 	if err := tr.Probe([]byte("p"), testICMPPeer); !errors.Is(err, ErrTransportUnsupported) {
 		t.Fatalf("Probe with probe=false = %v, want ErrTransportUnsupported", err)
@@ -1220,7 +1213,7 @@ func TestICMPTransportProbeCanBeDisabledByProfile(t *testing.T) {
 
 func TestICMPTransportCarrierConditionTracksTheMonitor(t *testing.T) {
 	tr, _ := newTestICMPTransport(t, ICMPProfile{
-		Family: "ipv4", MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
+		MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
 	}, Nop{})
 
 	base := tr.RTOFloor()
@@ -1247,7 +1240,7 @@ func TestICMPTransportCarrierConditionTracksTheMonitor(t *testing.T) {
 
 func TestICMPTransportReplyAndEchoMirrorTheObservedPath(t *testing.T) {
 	tr, plat := newTestICMPTransport(t, ICMPProfile{
-		Family: "ipv4", MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
+		MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
 	}, Nop{})
 
 	path := PathID{Peer: testICMPPeer, Ident: 0x4242, Seq: 0x0101}
@@ -1266,7 +1259,7 @@ func TestICMPTransportReplyAndEchoMirrorTheObservedPath(t *testing.T) {
 
 func TestICMPTransportSendsWithAFreshIdentifierAndSequence(t *testing.T) {
 	tr, plat := newTestICMPTransport(t, ICMPProfile{
-		Family: "ipv4", MaxPayload: 1200, MTUMode: "auto", PaceMS: 1, IDRange: "700-709",
+		MaxPayload: 1200, MTUMode: "auto", PaceMS: 1, IDRange: "700-709",
 	}, Nop{})
 	for i := 0; i < 3; i++ {
 		if err := tr.WriteRecord([]byte("x"), testICMPPeer); err != nil {
@@ -1300,7 +1293,7 @@ func TestICMPTransportSendsWithAFreshIdentifierAndSequence(t *testing.T) {
 
 func TestICMPTransportCloseIsIdempotentAndUnblocksReads(t *testing.T) {
 	tr, plat := newTestICMPTransport(t, ICMPProfile{
-		Family: "ipv4", MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
+		MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
 	}, Nop{})
 
 	done := make(chan error, 1)
@@ -1345,11 +1338,9 @@ func TestNewICMPClientTransportValidatesBeforeTouchingSockets(t *testing.T) {
 		peer    netip.Addr
 		wantSub string
 	}{
-		{"bad profile", ICMPProfile{Family: "ipv5"}, netip.MustParseAddr("192.0.2.1"), "icmp.family"},
+		{"bad profile", ICMPProfile{MaxPayload: 9999}, netip.MustParseAddr("192.0.2.1"), "icmp.max_payload"},
 		{"bad id range", ICMPProfile{IDRange: "nope"}, netip.MustParseAddr("192.0.2.1"), "icmp.id_range"},
 		{"missing peer", ICMPProfile{}, netip.Addr{}, "needs a peer address"},
-		{"v4 profile with a v6 peer", ICMPProfile{Family: "ipv4"}, netip.MustParseAddr("2001:db8::1"), "IPv6"},
-		{"v6 profile with a v4 peer", ICMPProfile{Family: "ipv6"}, netip.MustParseAddr("192.0.2.1"), "IPv4"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1377,7 +1368,7 @@ func TestNewICMPServerTransportValidatesProfile(t *testing.T) {
 // §4.1: a platform with no ICMP carrier must refuse with an actionable message,
 // never start a tunnel that silently carries nothing.
 func TestICMPServerTransportIsExplicitOnUnsupportedPlatforms(t *testing.T) {
-	tr, err := newICMPServerTransport(ICMPProfile{Family: "ipv4", PaceMS: 1}, Nop{})
+	tr, err := newICMPServerTransport(ICMPProfile{PaceMS: 1}, Nop{})
 	switch runtime.GOOS {
 	case "linux", "android":
 		// Linux needs CAP_NET_RAW; the test runner is usually unprivileged, and
@@ -1405,7 +1396,7 @@ func TestICMPServerTransportIsExplicitOnUnsupportedPlatforms(t *testing.T) {
 
 func TestICMPTransportCapabilitySurface(t *testing.T) {
 	tr, _ := newTestICMPTransport(t, ICMPProfile{
-		Family: "ipv4", MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
+		MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
 	}, Nop{})
 
 	var asTransport Transport = tr

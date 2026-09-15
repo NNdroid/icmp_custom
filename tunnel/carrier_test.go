@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -11,114 +12,22 @@ import (
 // carrier. Two things about them are worth pinning down, because both are easy
 // to regress without any test failing:
 //
-//  1. ORDERING. An unsupported transport NAME must be rejected before a socket
-//     is opened, and before the platform is consulted. Otherwise a typo'd
-//     `transport` on Linux would surface as a confusing CAP_NET_RAW error, and
-//     on Windows as a platform error that hides the real mistake.
+//  1. ORDERING. A bad peer or profile must be rejected before a socket is
+//     opened and before the platform is consulted. Otherwise a typo'd value on
+//     Linux would surface as a confusing CAP_NET_RAW error, and on Windows as
+//     a platform error that hides the real mistake.
 //
 //  2. MAPPING. The ICMP profile owns the poll schedule, because on a
 //     request-driven carrier the request window IS the downlink ceiling. The
 //     mapping must fill only unset fields, so an embedder's explicit values
 //     survive.
 
-func TestResolveTransportAcceptsOnlyICMP(t *testing.T) {
-	accepted := []string{"", "icmp", "ICMP", " icmp ", "Icmp", "\ticmp\n"}
-	for _, in := range accepted {
-		got, err := resolveTransport(in)
-		if err != nil {
-			t.Fatalf("resolveTransport(%q) returned error: %v", in, err)
-		}
-		if got != TransportICMP {
-			t.Fatalf("resolveTransport(%q) = %q, want %q", in, got, TransportICMP)
-		}
-	}
-
-	// Every rejection must keep the sentinel in the chain and name both the
-	// offending value and the accepted one, so the operator is never left
-	// guessing what this build speaks.
-	for _, in := range []string{"udp", "UDP", "tcp", "discard", "icmp2", "icmpv6"} {
-		_, err := resolveTransport(in)
-		if err == nil {
-			t.Fatalf("resolveTransport(%q) unexpectedly succeeded", in)
-		}
-		if !errors.Is(err, ErrConfigRequired) {
-			t.Fatalf("resolveTransport(%q) error %v does not wrap ErrConfigRequired", in, err)
-		}
-		msg := err.Error()
-		if !strings.Contains(msg, in) {
-			t.Fatalf("resolveTransport(%q) error %q does not quote the offending value", in, msg)
-		}
-		if !strings.Contains(msg, TransportICMP) {
-			t.Fatalf("resolveTransport(%q) error %q does not name %q", in, msg, TransportICMP)
-		}
-	}
-}
-
-func TestCheckTransportMatchesTheUnexportedResolver(t *testing.T) {
-	for _, in := range []string{"", "icmp", "udp", " ICMP "} {
-		wantName, wantErr := resolveTransport(in)
-		gotName, gotErr := CheckTransport(in)
-		if gotName != wantName {
-			t.Fatalf("CheckTransport(%q) name = %q, want %q", in, gotName, wantName)
-		}
-		if (gotErr == nil) != (wantErr == nil) {
-			t.Fatalf("CheckTransport(%q) err = %v, resolveTransport err = %v", in, gotErr, wantErr)
-		}
-		if gotErr != nil && !errors.Is(gotErr, ErrConfigRequired) {
-			t.Fatalf("CheckTransport(%q) error %v does not wrap ErrConfigRequired", in, gotErr)
-		}
-	}
-}
-
-// The distinguishing assertion is the NEGATIVE one: an unsupported transport
-// has to produce a config error and NOT the sentinel that means "this platform
-// has no ICMP carrier". If the ordering ever flips, this test fails on every
-// platform, including the ones where the carrier would build fine.
-func TestNewServerRejectsUnknownTransportBeforeTouchingThePlatform(t *testing.T) {
-	_, err := NewServer(ServerConfig{
-		Transport:  "udp",
-		TargetAddr: "tcp://127.0.0.1:22",
-		Passwords:  []string{"secret"},
-	})
-	if err == nil {
-		t.Fatal("NewServer accepted transport \"udp\"")
-	}
-	if !errors.Is(err, ErrConfigRequired) {
-		t.Fatalf("error %v does not wrap ErrConfigRequired", err)
-	}
-	if errors.Is(err, ErrTransportUnsupported) {
-		t.Fatalf("error %v is a platform error; the transport name must be checked first", err)
-	}
-	if !strings.Contains(err.Error(), "udp") {
-		t.Fatalf("error %q does not quote the offending transport", err)
-	}
-}
-
-func TestNewClientRejectsUnknownTransportBeforeTouchingThePlatform(t *testing.T) {
-	_, err := NewClient(ClientConfig{
-		Transport:  "udp",
-		ServerAddr: "203.0.113.9",
-		Passwords:  []string{"secret"},
-		ListenAddr: "127.0.0.1:1080",
-	})
-	if err == nil {
-		t.Fatal("NewClient accepted transport \"udp\"")
-	}
-	if !errors.Is(err, ErrConfigRequired) {
-		t.Fatalf("error %v does not wrap ErrConfigRequired", err)
-	}
-	if errors.Is(err, ErrTransportUnsupported) {
-		t.Fatalf("error %v is a platform error; the transport name must be checked first", err)
-	}
-}
-
-// A malformed profile must be rejected before the platform is consulted too:
+// A malformed profile must be rejected before the platform is consulted:
 // otherwise a `max_payload` typo would be reported as "no ICMP carrier on
 // windows" on a Windows dev box, which sends the operator down the wrong path.
 func TestNewClientRejectsBadProfileBeforeTouchingThePlatform(t *testing.T) {
 	for name, prof := range map[string]ICMPProfile{
 		"max_payload too large": {MaxPayload: 9999},
-		"family unknown":        {Family: "ipv5"},
 		"mtu_min above budget":  {MaxPayload: 1200, MTUMin: 1300},
 		"mtu_mode unknown":      {MTUMode: "guess"},
 		"pace_ms zero":          {PaceMS: -1},
@@ -126,7 +35,6 @@ func TestNewClientRejectsBadProfileBeforeTouchingThePlatform(t *testing.T) {
 		"block_timeout bad":     {BlockTimeout: "not-a-duration"},
 	} {
 		_, err := NewClient(ClientConfig{
-			Transport:  TransportICMP,
 			ICMP:       prof,
 			ServerAddr: "203.0.113.9",
 			Passwords:  []string{"secret"},
@@ -146,7 +54,6 @@ func TestNewClientRejectsBadProfileBeforeTouchingThePlatform(t *testing.T) {
 
 func TestNewClientRejectsMissingServerBeforeTouchingThePlatform(t *testing.T) {
 	_, err := NewClient(ClientConfig{
-		Transport:  TransportICMP,
 		ServerAddr: "   ",
 		Passwords:  []string{"secret"},
 		ListenAddr: "127.0.0.1:1080",
@@ -242,7 +149,6 @@ func TestClientPollScheduleReflectsTheProfile(t *testing.T) {
 	defer a.Close()
 
 	cli, err := NewClientWithTransport(ClientConfig{
-		Transport:  TransportICMP,
 		ICMP:       ICMPProfile{PollsInFlight: 6, PaceMS: 30, IdlePollMS: 250, KeepAliveMS: 3000},
 		ServerAddr: "203.0.113.9",
 		Passwords:  []string{"secret"},
@@ -284,17 +190,98 @@ func TestICMPProfileValidateMirrorsResolve(t *testing.T) {
 	if err := (ICMPProfile{}).Validate(); err != nil {
 		t.Fatalf("the zero profile must validate (it is the default profile): %v", err)
 	}
-	if err := (ICMPProfile{Family: "ipv7"}).Validate(); err == nil {
-		t.Fatal("Validate accepted an unknown family")
+	if err := (ICMPProfile{MTUMode: "ipv7"}).Validate(); err == nil {
+		t.Fatal("Validate accepted an unknown mtu_mode")
 	} else if !errors.Is(err, ErrConfigRequired) {
 		t.Fatalf("Validate error %v does not wrap ErrConfigRequired", err)
 	}
-	// Validate must apply the same defaults resolve does: an explicit budget
-	// equal to the default must be accepted for both families.
-	if err := (ICMPProfile{Family: "ipv6", MaxPayload: icmpV6MaxPayload}).Validate(); err != nil {
-		t.Fatalf("IPv6 ceiling rejected: %v", err)
+	// Validate must apply the same defaults resolve does, including the single
+	// family-independent ceiling: the dual-stack safe value is accepted, the
+	// IPv4-only ceiling it replaced is now rejected.
+	if err := (ICMPProfile{MaxPayload: icmpV6MaxPayload}).Validate(); err != nil {
+		t.Fatalf("the dual-stack ceiling must validate: %v", err)
 	}
-	if err := (ICMPProfile{Family: "ipv4", MaxPayload: icmpV6MaxPayload}).Validate(); err != nil {
-		t.Fatalf("IPv4 accepts up to %d and the IPv6 ceiling is smaller: %v", icmpV4MaxPayload, err)
+	if err := (ICMPProfile{MaxPayload: icmpV4MaxPayload}).Validate(); err == nil {
+		t.Fatalf("IPv4's %d is above the dual-stack ceiling and must be rejected", icmpV4MaxPayload)
+	}
+}
+
+// The SYN rate limiter is the one gate an unauthenticated sender can drive, so
+// its memory must be bounded: a spoofed-source flood that keeps creating
+// buckets would otherwise be a slow remote memory DoS. The cap is FAIL-CLOSED
+// — new sources are refused while the table is full, live sources keep their
+// buckets, and pruning frees room for genuinely new sources.
+func TestSynLimiterCapsTheBucketTableAndKeepsLiveSources(t *testing.T) {
+	l := newSynLimiter(1000, 1)
+	now := time.Now()
+
+	for i := 0; i < synBucketCap; i++ {
+		ip := fmt.Sprintf("10.%d.%d.1", i/256, i%256)
+		if !l.Allow(ip, now) {
+			t.Fatalf("source %s refused before the cap was reached", ip)
+		}
+	}
+	if l.Len() != synBucketCap {
+		t.Fatalf("table holds %d buckets, want %d", l.Len(), synBucketCap)
+	}
+
+	if l.Allow("10.200.0.1", now) {
+		t.Fatal("a new source was admitted while the table was full")
+	}
+	if n := l.Rejected(); n != 1 {
+		t.Fatalf("Rejected = %d, want 1", n)
+	}
+
+	// A source that was already talking keeps working: its bucket refills.
+	if !l.Allow("10.0.0.1", now.Add(time.Second)) {
+		t.Fatal("an existing live source was refused while under its rate")
+	}
+
+	// Pruning frees room for genuinely new sources: backdate one bucket's
+	// last-touched time past the idle TTL and the next new source is admitted.
+	l.mu.Lock()
+	l.buckets["10.0.2.1"].last = now.Add(-2 * time.Minute)
+	l.mu.Unlock()
+	if !l.Allow("10.200.0.2", now.Add(time.Second)) {
+		t.Fatal("a new source was refused although an idle bucket was prunable")
+	}
+}
+
+// A portless allowed_targets pattern silently widens to EVERY port on the
+// hosts it names ("tcp://*" grants all TCP everywhere). The construction-time
+// warning is what keeps that widening from being a surprise — and fully
+// spelled-out patterns must stay quiet.
+func TestAllowedTargetPatternWarnings(t *testing.T) {
+	cEp, sEp := newFakeLink("client", "server", testRecordLimit)
+	defer cEp.Close()
+
+	logs := &captureLogger{}
+	srv, err := NewServerWithTransport(ServerConfig{
+		TargetAddr: "tcp://127.0.0.1:22",
+		Passwords:  []string{"secret"},
+		AllowedTargets: []string{
+			"tcp://*",          // portless: grants every port via the fallback
+			"tcp://10.0.0.6",   // portless, no wildcard: never matches
+			"tcp://10.0.0.5:*", // explicit port wildcard: normal semantics, quiet
+			"tcp://10.0.0.7:22",
+		},
+		Logger: logs,
+	}, sEp, nil)
+	if err != nil {
+		t.Fatalf("NewServerWithTransport: %v", err)
+	}
+	defer srv.Close()
+
+	// Only the TRULY portless pattern widens: "10.0.0.5:*" spells its port
+	// out (as the wildcard) and takes the normal host+port matching path, so
+	// it must stay quiet.
+	if logs.find(`"tcp://*"`) == "" {
+		t.Fatal("a portless wildcard pattern must draw the every-port warning")
+	}
+	if logs.find(`"tcp://10.0.0.6"`) == "" {
+		t.Fatal("a portless pattern without wildcards must draw the never-match warning")
+	}
+	if logs.find(`"tcp://10.0.0.5:*"`) != "" || logs.find(`"tcp://10.0.0.7:22"`) != "" {
+		t.Fatal("a pattern with an explicit port must not draw a warning")
 	}
 }

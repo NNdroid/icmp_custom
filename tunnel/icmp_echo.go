@@ -38,18 +38,35 @@ func combineOpenErrors(errs []error) error {
 }
 
 // netipAddrOf converts a net.Addr reported by a socket read into a netip.Addr,
-// unmapping IPv4-in-IPv6 forms so the socket lookup stays unambiguous.
+// unmapping IPv4-in-IPv6 forms so the socket lookup stays unambiguous. Both
+// carrier shapes are accepted: a raw IPConn reports *net.IPAddr, and a ping
+// socket — which the runtime classifies by its bound ident "port" — comes back
+// as a UDPConn reporting *net.UDPAddr.
 func netipAddrOf(a net.Addr) netip.Addr {
-	ipa, ok := a.(*net.IPAddr)
-	if !ok || ipa.IP == nil {
+	var ip net.IP
+	switch addr := a.(type) {
+	case *net.IPAddr:
+		if addr == nil {
+			return netip.Addr{}
+		}
+		ip = addr.IP
+	case *net.UDPAddr:
+		if addr == nil {
+			return netip.Addr{}
+		}
+		ip = addr.IP
+	default:
 		return netip.Addr{}
 	}
-	if v4 := ipa.IP.To4(); v4 != nil {
+	if ip == nil {
+		return netip.Addr{}
+	}
+	if v4 := ip.To4(); v4 != nil {
 		if addr, ok := netip.AddrFromSlice(v4); ok {
 			return addr.Unmap()
 		}
 	}
-	addr, ok := netip.AddrFromSlice(ipa.IP)
+	addr, ok := netip.AddrFromSlice(ip)
 	if !ok {
 		return netip.Addr{}
 	}

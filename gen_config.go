@@ -178,9 +178,6 @@ func templateFor(role string) string {
 }
 
 const serverTemplate = `{
-  // The only transport this project implements. Omit it to get the same thing.
-  "transport": "icmp",
-
   "log_level": "info",
 
   // The default forwarding endpoint for clients that request none.
@@ -188,7 +185,10 @@ const serverTemplate = `{
   "target": "tcp://127.0.0.1:22",
 
   // Accepted PSKs. At least one is mandatory; there is no open mode.
-  // ` + "`psk`" + ` and ` + "`password`" + ` are accepted as aliases.
+  // ` + "`psk`" + ` and ` + "`password`" + ` are accepted as aliases. Use a
+  // HIGH-ENTROPY secret (e.g. ` + "`openssl rand -base64 24`" + `); short or
+  // human-guessable values are brute-forceable online, and there is no
+  // second factor.
   "passwords": ["CHANGE-ME"],
 
   // Optional: enables Noise_NK forward secrecy. Generate with ` + "`gen-keys`" + `.
@@ -207,7 +207,6 @@ const serverTemplate = `{
   "send_window": 256,
 
   "icmp": {
-    "family": "auto",        // auto | ipv4 | ipv6 (auto binds both raw sockets)
     "max_payload": 1200,     // start and hard ceiling of the MTU search
     "mtu_mode": "probe",     // probe | auto (in-band only) | fixed
     "mtu_min": 548,          // never step below (IPv4 reassembly floor)
@@ -221,8 +220,6 @@ const serverTemplate = `{
 `
 
 const clientTemplate = `{
-  "transport": "icmp",
-
   "log_level": "info",
 
   // The peer to tunnel to. ICMP binds no port, so a bare host is natural;
@@ -232,7 +229,8 @@ const clientTemplate = `{
   // The endpoint requested from the server. Leave empty for its default.
   "target": "tcp://127.0.0.1:22",
 
-  // Must match the server's PSK.
+  // Must match the server's PSK. Use a HIGH-ENTROPY secret; short or
+  // human-guessable values are brute-forceable online.
   "passwords": ["CHANGE-ME"],
 
   // Optional: the server's Noise public key (from ` + "`gen-keys`" + `). Empty =
@@ -250,7 +248,6 @@ const clientTemplate = `{
   "handshake_backoff_ms": 400,
 
   "icmp": {
-    "family": "auto",
     "max_payload": 1200,
     "mtu_mode": "probe",
     "mtu_min": 548,

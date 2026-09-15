@@ -336,7 +336,12 @@ func (p *pingICMP) send(v4Type, v6Type byte, payload []byte, dst netip.Addr, ide
 		msgType = v6Type
 	}
 	msg := buildEchoMessage(msgType, ident, seq, payload, false)
-	addr := net.IPAddr{IP: dst.AsSlice()}
+	// The runtime classifies a ping socket by its bound "port" (the ident), so
+	// the conn here is a UDPConn — and a UDPConn's WriteTo rejects a *net.IPAddr
+	// in user space with EINVAL before the syscall ever runs. Address it as the
+	// conn demands; the kernel ignores the port field of a ping socket's
+	// destination and stamps its own ident on the wire.
+	addr := net.UDPAddr{IP: dst.AsSlice()}
 	if _, err := s.conn.WriteTo(msg, &addr); err != nil {
 		return interpretPingSendError(err)
 	}

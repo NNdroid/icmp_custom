@@ -61,7 +61,33 @@ func (Nop) Errorf(string, ...any) {}
 
 // stdLogger writes through the standard logger, filtered by level. The prefix
 // is padded so debug/info/warn/error columns line up in log files.
+//
+// Each line is also decorated with a level emoji at the very head, so an
+// operator scanning a wall of output can spot warn/error rows without reading
+// words. Two rules keep the decoration cheap and safe:
+//
+//  1. The emoji sits OUTSIDE the "[LEVEL]" bracket, so the bracket stays
+//     byte-identical to before: grep "[ERROR]" still matches.
+//  2. All four emoji are 4-byte UTF-8 sequences. Equal byte length means the
+//     message column stays aligned exactly as it was; a mix of 3- and 6-byte
+//     emoji (⚠️, ❌) would shift the column line to line.
 type stdLogger struct{ level int }
+
+// levelEmoji maps a level word to its head decoration. An unknown level is
+// returned undecorated, so emit never invents a prefix the tests do not pin.
+func levelEmoji(prefix string) string {
+	switch prefix {
+	case "DEBUG":
+		return "🔍"
+	case "INFO":
+		return "🟢"
+	case "WARN":
+		return "🟡"
+	case "ERROR":
+		return "🔴"
+	}
+	return ""
+}
 
 func (l stdLogger) emit(min int, prefix, format string, args ...any) {
 	if l.level > min {
@@ -70,7 +96,7 @@ func (l stdLogger) emit(min int, prefix, format string, args ...any) {
 	// The prefix is padded to the width of "DEBUG" so the message columns line
 	// up in a log file: an operator greps these lines, and a ragged column
 	// makes them read as noise.
-	log.Printf("[%-5s] "+format, append([]any{prefix}, args...)...)
+	log.Printf("%s [%-5s] "+format, append([]any{levelEmoji(prefix), prefix}, args...)...)
 }
 
 // Debugf implements Logger.

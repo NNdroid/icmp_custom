@@ -156,6 +156,17 @@ jobs:
       # device-gated tests (openPingSocket + protectFD ordering, loopback
       # round trip, the ping_group_range self-check against the real sysctl)
       # and the host-portable ping tests all execute here for real.
+      #
+      # The runner executes the script one physical line per `sh -c`
+      # invocation: backslash continuations do NOT join lines and `$?` does
+      # not survive across them. Every command therefore stays on one line,
+      # and the test line is last so its exit code — propagated by adb's
+      # shell v2 — decides the step. Output streams to the job log directly.
+      #
+      # The quoted test line is deliberate: adb shell forwards its argument to
+      # the DEVICE's shell, which re-parses it. The inner double quotes keep
+      # the binary path one word and the inner single quotes keep the
+      # -test.run regex's `|` from being read as a pipe by the device shell.
       - name: Run tests on the emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -168,19 +179,4 @@ jobs:
             adb wait-for-device
             adb push "$ANDROID_TEST_BIN" /data/local/tmp/
             adb shell chmod 755 /data/local/tmp/"$ANDROID_TEST_BIN"
-            # /bin/sh (dash) here has no pipefail; capture the binary's own
-            # exit code instead of teeing through a pipe.
-            adb shell /data/local/tmp/"$ANDROID_TEST_BIN" \
-              -test.run 'TestDevicePing|TestPing|TestCheckPingGroupRange|TestParsePingGroupRange|TestSelfFsgid' \
-              -test.timeout 10m -test.v > android-test.log 2>&1
-            code=$?
-            cat android-test.log
-            exit $code
-
-      - name: Upload android test output (always, for post-mortem)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-test-output
-          path: android-test.log
-          if-no-files-found: ignore
+            adb shell "/data/local/tmp/\"$ANDROID_TEST_BIN\" -test.run 'TestDevicePing|TestPing|TestCheckPingGroupRange|TestParsePingGroupRange|TestSelfFsgid' -test.timeout 10m -test.v"

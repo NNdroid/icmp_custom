@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -140,17 +141,47 @@ func openPingSocket(family int, protectFD func(fd int) error) (*pingSocket, erro
 		}
 	}
 
-	// Hand the descriptor to the runtime's netpoller: os.NewFile dups and sets
-	// O_NONBLOCK, and FilePacketConn wraps it as a PacketConn whose ReadFrom /
-	// WriteTo speak *net.IPAddr — the same surface the raw carrier uses.
+	// Hand the descriptor to the runtime's netpoller. FilePacketConn duplicates
+	// the descriptor (O_NONBLOCK lands on the dup) and classifies the socket by
+	// its bound "port" (the ident) — which wraps it as a UDPConn, so
+	// ReadFrom / WriteTo speak *net.UDPAddr, NOT the raw carrier's
+	// *net.IPAddr; icmp_ping.go addresses its sends accordingly.
 	file := os.NewFile(uintptr(fd), name)
 	conn, err := net.FilePacketConn(file)
 	if err != nil {
 		return fail("icmp: wrapping the IPv%d ping socket failed: %w", family, err)
 	}
-	_ = file.Close() // conn owns the descriptor now
+	_ = file.Close() // the runtime owns the duplicate now; the original fd is gone
 
-	return &pingSocket{conn: conn, fd: fd, family: family}, nil
+	// Cleanup past this point must close the runtime's duplicate — the original
+	// descriptor died with file.Close(), and closing its number again would
+	// race any fd the runtime opened in between.
+	fail = func(format string, args ...any) (*pingSocket, error) {
+		_ = conn.Close()
+		return nil, fmt.Errorf(format, args...)
+	}
+
+	// The sockPort hook reads the ident back out of getsockname and must
+	// consult a descriptor that is still open. Everything above (protect
+	// included) used the original, which file.Close() has just closed; the
+	// runtime kept a duplicate, so re-resolve the live one for the hook.
+	sc, ok := conn.(syscall.Conn)
+	if !ok {
+		return fail("icmp: the wrapped IPv%d socket lost its syscall.Conn surface", family)
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return fail("icmp: reaching the wrapped IPv%d descriptor failed: %w", family, err)
+	}
+	liveFD := -1
+	if cerr := raw.Control(func(f uintptr) { liveFD = int(f) }); cerr != nil {
+		return fail("icmp: reading the wrapped IPv%d descriptor failed: %v", family, cerr)
+	}
+	if liveFD <= 0 {
+		return fail("icmp: the wrapped IPv%d socket reports descriptor %d", family, liveFD)
+	}
+
+	return &pingSocket{conn: conn, fd: liveFD, family: family}, nil
 }
 
 func wildcardSockaddr(family int) unix.Sockaddr {

@@ -103,7 +103,7 @@ func TestInterpretSendErrorMapsTheProfileSentinels(t *testing.T) {
 func newRootICMPTransport(t *testing.T, bindV4, bindV6 bool) (*icmpTransport, *icmpCore) {
 	t.Helper()
 	resolved, err := (ICMPProfile{
-		Family: "auto", MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
+		MaxPayload: 1200, MTUMode: "auto", PaceMS: 1,
 	}).resolve()
 	if err != nil {
 		t.Fatalf("resolve: %v", err)

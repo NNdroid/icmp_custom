@@ -213,11 +213,21 @@ func TestNetipAddrOfUnmapsIPv4InIPv6(t *testing.T) {
 		t.Fatalf("native IPv6 address = %v", got)
 	}
 
+	// The ping-socket carrier reads peers through a UDPConn, whose ReadFrom
+	// reports *net.UDPAddr — the "port" is the ICMP ident and is ignored here.
+	got = netipAddrOf(&net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 4242})
+	if !got.Is4() || got.String() != "203.0.113.7" {
+		t.Fatalf("UDPAddr peer = %v, want 203.0.113.7", got)
+	}
+
 	if a := netipAddrOf(&net.TCPAddr{}); a.IsValid() {
 		t.Fatalf("a non-IPAddr source must yield the zero Addr, got %v", a)
 	}
 	if a := netipAddrOf(&net.IPAddr{}); a.IsValid() {
 		t.Fatalf("a nil IP must yield the zero Addr, got %v", a)
+	}
+	if a := netipAddrOf(&net.UDPAddr{Port: 80}); a.IsValid() {
+		t.Fatalf("a UDPAddr with a nil IP must yield the zero Addr, got %v", a)
 	}
 }
 

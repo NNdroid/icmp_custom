@@ -57,7 +57,6 @@ const (
 	icmpDefaultMTUStep  = 100
 	icmpDefaultPaceMS   = 20
 	icmpDefaultBlockTO  = 60 * time.Second
-	icmpDefaultFamily   = "auto"
 	icmpDefaultMTUMode  = "probe"
 	icmpDefaultPollsIF  = 4
 	icmpDefaultIdleMS   = 1000
@@ -78,11 +77,12 @@ const (
 // `sendsock_max`, `receive_sockets`. Those describe the UDP profile's
 // port-spreading machinery, which has no ICMP counterpart and belongs to
 // another project. Because encoding/json ignores unknown keys, a config file
-// that still carries them is accepted and simply not read.
+// that still carries them is accepted and simply not read. `family` is not
+// here either, for the same reason a client does not configure it: there is no
+// meaningful choice. A server binds both families; a client follows its peer.
+// A leftover `family` key in an existing config is therefore ignored, not an
+// error.
 type ICMPProfile struct {
-	// Family selects the address family. "auto" (default) makes the server
-	// bind both raw sockets and the client follow its peer.
-	Family string `json:"family"`
 	// MaxPayload is the largest complete v2 record to carry. It is both the
 	// starting point and the hard ceiling of the automatic MTU search.
 	MaxPayload int `json:"max_payload"`
@@ -122,12 +122,15 @@ type ICMPProfile struct {
 	BlockTimeout string `json:"block_timeout"`
 }
 
-// icmpFamily is the resolved address family.
+// icmpFamily is the address family of one socket. The profile no longer asks
+// the operator for it: a server binds both, a client follows its peer — the
+// only two choices that ever made sense. The type stays because the socket
+// layer is still per-family.
 type icmpFamily int
 
 const (
-	// familyAuto lets each end choose: the server binds both raw sockets, the
-	// client follows its peer.
+	// familyAuto means "both" for a server and is resolved to the peer's
+	// family for a client.
 	familyAuto icmpFamily = iota
 	familyV4
 	familyV6
@@ -144,36 +147,18 @@ func (f icmpFamily) String() string {
 	}
 }
 
-func parseICMPFamily(s string) (icmpFamily, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "", "auto":
-		return familyAuto, nil
-	case "ipv4":
-		return familyV4, nil
-	case "ipv6":
-		return familyV6, nil
-	}
-	return familyAuto, fmt.Errorf("%w: icmp.family = %q (want auto, ipv4 or ipv6)", ErrConfigRequired, s)
-}
-
 // budgetBounds reports the config acceptance interval for the complete-record
-// budget on a family. "auto" must satisfy both families, so its ceiling is the
-// smaller of the two — a budget that only fits IPv4 would make the IPv6 half of
-// a dual-stack server silently oversized.
-func budgetBounds(f icmpFamily) (lo, hi int) {
-	switch f {
-	case familyV4:
-		return icmpMinPayload, icmpV4MaxPayload
-	case familyV6:
-		return icmpMinPayload, icmpV6MaxPayload
-	default:
-		return icmpMinPayload, icmpV6MaxPayload
-	}
+// budget. It is family-independent and equals what "auto" always demanded: the
+// smaller of the two per-family ceilings. A dual-stack server binds both
+// families, and a budget that only fits IPv4 would silently oversized its
+// IPv6 half; the peer's own profile can put records up to this same bound on
+// the wire, so it is also the receive ceiling.
+func budgetBounds() (lo, hi int) {
+	return icmpMinPayload, icmpV6MaxPayload
 }
 
 // resolvedProfile is a validated ICMPProfile with every default applied.
 type resolvedProfile struct {
-	family        icmpFamily
 	maxPayload    int
 	mtuMode       mtuMode
 	mtuMin        int
@@ -195,18 +180,14 @@ func (p ICMPProfile) resolve() (resolvedProfile, error) {
 	var out resolvedProfile
 	var err error
 
-	if out.family, err = parseICMPFamily(p.Family); err != nil {
-		return out, err
-	}
-
-	lo, hi := budgetBounds(out.family)
+	lo, hi := budgetBounds()
 	out.maxPayload = p.MaxPayload
 	if out.maxPayload == 0 {
 		out.maxPayload = icmpDefaultMaxPayload
 	}
 	if out.maxPayload < lo || out.maxPayload > hi {
-		return out, fmt.Errorf("%w: icmp.max_payload = %d, want %d..%d for family %s",
-			ErrConfigRequired, out.maxPayload, lo, hi, out.family)
+		return out, fmt.Errorf("%w: icmp.max_payload = %d, want %d..%d",
+			ErrConfigRequired, out.maxPayload, lo, hi)
 	}
 
 	if out.mtuMode, err = parseMTUMode(p.MTUMode); err != nil {
@@ -1200,8 +1181,10 @@ func (t *icmpTransport) Close() error {
 
 // newICMPClientTransport builds the client-side ICMP carrier for one peer.
 //
-// protectFD is only meaningful on Android; desktop callers pass nil. The peer
-// determines the socket family when the profile says "auto".
+// protectFD is only meaningful on Android; desktop callers pass nil. The peer's
+// address determines the socket family — an IPv4 peer is reached over an IPv4
+// socket, an IPv6 peer over IPv6. There is no configuration for this because
+// there is no meaningful choice: the peer is where the packets go.
 func newICMPClientTransport(prof ICMPProfile, peer netip.Addr, logger Logger, protectFD func(fd int) error) (Transport, error) {
 	resolved, err := prof.resolve()
 	if err != nil {
@@ -1211,19 +1194,9 @@ func newICMPClientTransport(prof ICMPProfile, peer netip.Addr, logger Logger, pr
 		return nil, fmt.Errorf("%w: client icmp transport needs a peer address", ErrConfigRequired)
 	}
 
-	fam := resolved.family
-	if fam == familyAuto {
-		if peer.Is6() && !peer.Is4In6() {
-			fam = familyV6
-		} else {
-			fam = familyV4
-		}
-	}
-	if fam == familyV4 && peer.Is6() && !peer.Is4In6() {
-		return nil, fmt.Errorf("%w: icmp.family = ipv4 but the peer %s is IPv6", ErrConfigRequired, peer)
-	}
-	if fam == familyV6 && peer.Is4() {
-		return nil, fmt.Errorf("%w: icmp.family = ipv6 but the peer %s is IPv4", ErrConfigRequired, peer)
+	fam := familyV4
+	if peer.Is6() && !peer.Is4In6() {
+		fam = familyV6
 	}
 
 	ids, err := newPooledIDs(resolved.idSpec)
@@ -1251,8 +1224,9 @@ func newICMPClientTransport(prof ICMPProfile, peer netip.Addr, logger Logger, pr
 	return &icmpTransport{platform: platform, core: core}, nil
 }
 
-// newICMPServerTransport builds the server-side ICMP carrier. With family
-// "auto" it binds both families and serves both from one Transport.
+// newICMPServerTransport builds the server-side ICMP carrier. A server has no
+// peer to follow, so it binds BOTH families and serves whichever arrives on
+// either from one Transport.
 func newICMPServerTransport(prof ICMPProfile, logger Logger) (Transport, error) {
 	resolved, err := prof.resolve()
 	if err != nil {
@@ -1266,24 +1240,17 @@ func newICMPServerTransport(prof ICMPProfile, logger Logger) (Transport, error) 
 
 	cfg := &icmpConfig{
 		role:   icmpRoleServer,
-		family: resolved.family,
+		family: familyAuto,
 		core:   core,
 	}
-	switch resolved.family {
-	case familyV4:
-		cfg.bindV4 = true
-	case familyV6:
-		cfg.bindV6 = true
-	default:
-		cfg.bindV4 = true
-		cfg.bindV6 = true
-	}
+	cfg.bindV4 = true
+	cfg.bindV6 = true
 
 	platform, err := newPlatformICMPTransport(cfg)
 	if err != nil {
 		return nil, err
 	}
 	logger.Infof("[ICMP] carrier ready family=%s v4=%t v6=%t budget=%d pace=%s mtu_mode=%s",
-		resolved.family, cfg.bindV4, cfg.bindV6, core.maxRecordSize(), resolved.pace, resolved.mtuMode)
+		familyAuto, cfg.bindV4, cfg.bindV6, core.maxRecordSize(), resolved.pace, resolved.mtuMode)
 	return &icmpTransport{platform: platform, core: core}, nil
 }

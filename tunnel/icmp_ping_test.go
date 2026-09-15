@@ -44,7 +44,10 @@ func newFakePingConn() *fakePingConn {
 func (c *fakePingConn) ReadFrom(buf []byte) (int, net.Addr, error) {
 	select {
 	case raw := <-c.inbound:
-		return copy(buf, raw), &net.IPAddr{IP: net.ParseIP("203.0.113.7")}, nil
+		// The real ping socket is wrapped as a UDPConn (the runtime classifies
+		// it by its bound ident "port"), so ReadFrom reports the peer as a
+		// *net.UDPAddr — mirror that here to keep the fake honest.
+		return copy(buf, raw), &net.UDPAddr{IP: net.ParseIP("203.0.113.7")}, nil
 	case <-c.closed:
 		return 0, nil, net.ErrClosed
 	}
