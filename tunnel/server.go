@@ -148,13 +148,17 @@ type Server struct {
 	sendWindow   int
 	maxRecvQueue int
 
-	// Counters (read with atomic; used for logging and Stats).
-	decodeFailures uint64 // undecodable records (junk, scans, mismatched peers)
-	macFailures    uint64 // v2 authentication failures
-	replayDrops    uint64 // authenticated records rejected by the replay window
-	queueFullDrops uint64 // reorder-buffer overflows
-	sendFailures   uint64 // carrier write failures
-	addrChanges    uint64 // times a session's observed peer address changed
+	// Atomic 64-bit counters (read with atomic; used for logging and Stats).
+	// These MUST be atomic.Uint64 (not bare uint64): the compiler 8-byte
+	// aligns that type even on 32-bit platforms, where an unaligned uint64
+	// makes every sync/atomic op panic (runtime panicUnaligned). See
+	// alignment.go for the build-time proof.
+	decodeFailures atomic.Uint64 // undecodable records (junk, scans, mismatched peers)
+	macFailures    atomic.Uint64 // v2 authentication failures
+	replayDrops    atomic.Uint64 // authenticated records rejected by the replay window
+	queueFullDrops atomic.Uint64 // reorder-buffer overflows
+	sendFailures   atomic.Uint64 // carrier write failures
+	addrChanges    atomic.Uint64 // times a session's observed peer address changed
 }
 
 // NewServerWithTransport builds a server on an injected carrier. It is the
@@ -289,7 +293,7 @@ func (s *Server) readLoop() {
 		}
 		var rec Record
 		if err := Parse(buf[:n], s.cfg.Magic, s.maxRecordSize, &rec); err != nil {
-			if c := atomic.AddUint64(&s.decodeFailures, 1); c == 1 || c%1000 == 0 {
+			if c := s.decodeFailures.Add(1); c == 1 || c%1000 == 0 {
 				s.logWarn("[Server] undecodable record from %s (%d bytes): %v (count=%d)", path.Peer, n, err, c)
 			}
 			continue
@@ -497,14 +501,14 @@ func (s *Server) handleHandshake(path PathID, rec *Record, matchedPSK string) {
 		targetAddr:    targetHostPort,
 		upstream:      upstream,
 		frameKeys:     frameKeys,
-		sendSeq:       1,
-		recvSeq:       1,
 		recvQueue:     make(map[uint64][]byte),
 		unacked:       make(map[uint64]*unackedPkt),
 		lastActive:    time.Now(),
 		closeChan:     make(chan struct{}),
 		rttEst:        newRTTEstimator(200*time.Millisecond, 200*time.Millisecond, 10*time.Second),
 	}
+	sess.sendSeq.Store(1)
+	sess.recvSeq.Store(1)
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	s.sessions.Store(sid, sess)
 
@@ -605,12 +609,12 @@ func (s *Server) cleanupLoop() {
 			})
 			s.logDebug("[Stats] sessions=%d authFail=%d replayDrop=%d queueFull=%d decodeFail=%d sendFail=%d addrChange=%d",
 				s.sessionCount(),
-				atomic.LoadUint64(&s.macFailures),
-				atomic.LoadUint64(&s.replayDrops),
-				atomic.LoadUint64(&s.queueFullDrops),
-				atomic.LoadUint64(&s.decodeFailures),
-				atomic.LoadUint64(&s.sendFailures),
-				atomic.LoadUint64(&s.addrChanges))
+				s.macFailures.Load(),
+				s.replayDrops.Load(),
+				s.queueFullDrops.Load(),
+				s.decodeFailures.Load(),
+				s.sendFailures.Load(),
+				s.addrChanges.Load())
 		}
 	}
 }
@@ -637,12 +641,12 @@ type ServerStats struct {
 func (s *Server) Stats() ServerStats {
 	return ServerStats{
 		Sessions:       s.sessionCount(),
-		AuthFailures:   atomic.LoadUint64(&s.macFailures),
-		DecodeFailures: atomic.LoadUint64(&s.decodeFailures),
-		ReplayDrops:    atomic.LoadUint64(&s.replayDrops),
-		QueueFullDrops: atomic.LoadUint64(&s.queueFullDrops),
-		SendFailures:   atomic.LoadUint64(&s.sendFailures),
-		AddressChanges: atomic.LoadUint64(&s.addrChanges),
+		AuthFailures:   s.macFailures.Load(),
+		DecodeFailures: s.decodeFailures.Load(),
+		ReplayDrops:    s.replayDrops.Load(),
+		QueueFullDrops: s.queueFullDrops.Load(),
+		SendFailures:   s.sendFailures.Load(),
+		AddressChanges: s.addrChanges.Load(),
 	}
 }
 
@@ -1059,9 +1063,9 @@ type ServerSession struct {
 	// AEAD for both DATA and control records and leave this nil.
 	frameKeys *FrameKeys
 
-	sendPacketNo uint64
-	sendSeq      uint64
-	recvSeq      uint64
+	sendPacketNo atomic.Uint64
+	sendSeq      atomic.Uint64
+	recvSeq      atomic.Uint64
 
 	rttEst *rttEstimator
 
@@ -1164,7 +1168,7 @@ func (sess *ServerSession) updateRemoteAddr(newAddr netip.AddrPort, allowIPChang
 			sess.sessionID, cur, newAddr)
 		return
 	}
-	atomic.AddUint64(&sess.server.addrChanges, 1)
+	sess.server.addrChanges.Add(1)
 	if sameIP {
 		sess.server.logDebug("[Session 0x%08X] NAT rebinding (same IP, new port): %s -> %s",
 			sess.sessionID, cur, newAddr)
@@ -1186,7 +1190,7 @@ func (sess *ServerSession) processIncomingRecord(rec *Record, path PathID) bool 
 		return false
 	}
 	if !sess.replayFilter.Accept(rec.PacketNo) {
-		atomic.AddUint64(&sess.server.replayDrops, 1)
+		sess.server.replayDrops.Add(1)
 		sess.server.emitSessionEvent(SessionEvent{
 			Kind:      SessionReplayDropped,
 			SessionID: sess.sessionID,
@@ -1222,7 +1226,7 @@ func (sess *ServerSession) verifyInboundRecord(rec *Record, path PathID) bool {
 	}
 	plain, err := OpenRecordAEAD(rec, sess.frameKeys.Recv)
 	if err != nil {
-		if n := atomic.AddUint64(&sess.server.macFailures, 1); n == 1 || n%100 == 0 {
+		if n := sess.server.macFailures.Add(1); n == 1 || n%100 == 0 {
 			sess.server.logWarn("[Session 0x%08X] record authentication rejected cmd=0x%02X from %s: %v",
 				sess.sessionID, rec.Cmd, path.Peer, err)
 			sess.server.emitSessionEvent(SessionEvent{
@@ -1348,7 +1352,7 @@ func (sess *ServerSession) acceptPathResponse(addr netip.AddrPort, data []byte) 
 // replyOn sends a record back along a specific observed path.
 func (sess *ServerSession) replyOn(data []byte, path PathID) error {
 	if err := sess.server.tr.ReplyRecord(data, path); err != nil {
-		atomic.AddUint64(&sess.server.sendFailures, 1)
+		sess.server.sendFailures.Add(1)
 		return err
 	}
 	return nil
@@ -1364,13 +1368,13 @@ func (sess *ServerSession) sendToSession(data []byte) {
 		return
 	}
 	if err := sess.server.tr.ReplyRecord(data, path); err != nil {
-		atomic.AddUint64(&sess.server.sendFailures, 1)
+		sess.server.sendFailures.Add(1)
 		sess.server.logWarn("[Session 0x%08X] reply failed: %v", sess.sessionID, err)
 	}
 }
 
 func (sess *ServerSession) currentAck() uint64 {
-	if next := atomic.LoadUint64(&sess.recvSeq); next > 0 {
+	if next := sess.recvSeq.Load(); next > 0 {
 		return next - 1
 	}
 	return 0
@@ -1416,7 +1420,7 @@ func (sess *ServerSession) handleDataFromPath(rec *Record, path PathID) bool {
 		sess.handleAck(rec.Ack)
 	}
 
-	expected := atomic.LoadUint64(&sess.recvSeq)
+	expected := sess.recvSeq.Load()
 	if rec.Seq != expected {
 		if rec.Seq < expected {
 			// Already delivered. The peer is retransmitting because it never
@@ -1433,7 +1437,7 @@ func (sess *ServerSession) handleDataFromPath(rec *Record, path PathID) bool {
 		accepted := true
 		if _, dup := sess.recvQueue[rec.Seq]; !dup {
 			if len(sess.recvQueue) >= sess.server.maxRecvQueue {
-				atomic.AddUint64(&sess.server.queueFullDrops, 1)
+				sess.server.queueFullDrops.Add(1)
 				accepted = false
 			} else {
 				sess.recvQueue[rec.Seq] = append([]byte(nil), payload...)
@@ -1487,7 +1491,7 @@ func (sess *ServerSession) handleDataFromPath(rec *Record, path PathID) bool {
 	if delivered == 0 {
 		return true
 	}
-	atomic.StoreUint64(&sess.recvSeq, expected+delivered)
+	sess.recvSeq.Store(expected + delivered)
 
 	// Ack the highest contiguous sequence just delivered.
 	sess.sendCumulativeACK(expected+delivered-1, path)
@@ -1552,7 +1556,7 @@ func writeAll(w io.Writer, data []byte) error {
 // as a ChaCha20-Poly1305 record. The buffer is freshly allocated: only use for
 // records whose wire bytes are retained (DATA).
 func (sess *ServerSession) encodeRecord(r *Record) []byte {
-	r.PacketNo = atomic.AddUint64(&sess.sendPacketNo, 1)
+	r.PacketNo = sess.sendPacketNo.Add(1)
 	if r.PacketNo == 0 || sess.frameKeys == nil {
 		return nil
 	}
@@ -1562,7 +1566,7 @@ func (sess *ServerSession) encodeRecord(r *Record) []byte {
 // sendControl seals a control record and hands it to send. Returns false when
 // the session lacks record protection or the packet-number space is exhausted.
 func (sess *ServerSession) sendControl(r *Record, send func([]byte) error) bool {
-	r.PacketNo = atomic.AddUint64(&sess.sendPacketNo, 1)
+	r.PacketNo = sess.sendPacketNo.Add(1)
 	if r.PacketNo == 0 || sess.frameKeys == nil {
 		return false
 	}
@@ -1592,7 +1596,7 @@ func (sess *ServerSession) sendData(payload []byte) error {
 		return ErrClosed
 	}
 
-	seq := atomic.AddUint64(&sess.sendSeq, 1) - 1
+	seq := sess.sendSeq.Add(1) - 1
 	rec := &Record{
 		Magic:      sess.server.cfg.Magic,
 		Version:    Version,

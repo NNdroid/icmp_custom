@@ -569,8 +569,6 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 		conn:       conn,
 		frameKeys:  frameKeys,
 		granted:    granted,
-		sendSeq:    1,
-		recvSeq:    1,
 		recvQueue:  make(map[uint64][]byte),
 		unacked:    make(map[uint64]*unackedPkt),
 		lastActive: time.Now(),
@@ -578,6 +576,8 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 		closeChan:  make(chan struct{}),
 		rttEst:     newRTTEstimator(200*time.Millisecond, 200*time.Millisecond, 10*time.Second),
 	}
+	sess.sendSeq.Store(1)
+	sess.recvSeq.Store(1)
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	c.sessions.Store(sid, sess)
 	c.logInfo("[Client] [Session 0x%08X] tunnel established", sid)
@@ -849,9 +849,13 @@ type clientSession struct {
 	// server's default target). Exposed through DialOptions.OnGranted.
 	granted string
 
-	sendPacketNo uint64
-	sendSeq      uint64
-	recvSeq      uint64
+	// Atomic 64-bit fields. These MUST be atomic.Uint64 (not bare uint64):
+	// the compiler 8-byte aligns that type even on 32-bit platforms, where an
+	// unaligned uint64 makes every sync/atomic op panic (runtime
+	// panicUnaligned). See alignment.go for the build-time proof.
+	sendPacketNo atomic.Uint64
+	sendSeq      atomic.Uint64
+	recvSeq      atomic.Uint64
 	replayFilter ReplayFilter
 
 	recvQueue map[uint64][]byte
@@ -1016,7 +1020,7 @@ func (s *clientSession) sendData(payload []byte) error {
 		return ErrClosed
 	}
 
-	seq := atomic.AddUint64(&s.sendSeq, 1) - 1
+	seq := s.sendSeq.Add(1) - 1
 	rec := &Record{
 		Magic: s.client.magic, Version: Version, Cmd: CmdData,
 		SessionID: s.sid, Seq: seq, Ack: s.currentAck(), Data: payload,
@@ -1227,7 +1231,7 @@ func (s *clientSession) handleData(rec *Record) bool {
 	defer s.recvMu.Unlock()
 
 	payload := rec.Data
-	expected := atomic.LoadUint64(&s.recvSeq)
+	expected := s.recvSeq.Load()
 	if rec.Seq != expected {
 		if rec.Seq < expected {
 			// Already delivered: the server is retransmitting because it lost
@@ -1272,7 +1276,7 @@ func (s *clientSession) handleData(rec *Record) bool {
 		delivered++
 	}
 	if delivered > 0 {
-		atomic.StoreUint64(&s.recvSeq, expected+delivered)
+		s.recvSeq.Store(expected + delivered)
 		s.sendACK(expected + delivered - 1)
 	}
 	return true
@@ -1292,7 +1296,7 @@ func (s *clientSession) sendACK(ackSeq uint64) {
 // sendControl seals a control record and hands it to send. Returns false when
 // the session lacks record protection or the packet-number space is exhausted.
 func (s *clientSession) sendControl(r *Record, send func([]byte) error) bool {
-	r.PacketNo = atomic.AddUint64(&s.sendPacketNo, 1)
+	r.PacketNo = s.sendPacketNo.Add(1)
 	if r.PacketNo == 0 || s.frameKeys == nil {
 		return false
 	}
@@ -1307,7 +1311,7 @@ func (s *clientSession) sendControl(r *Record, send func([]byte) error) bool {
 }
 
 func (s *clientSession) currentAck() uint64 {
-	if next := atomic.LoadUint64(&s.recvSeq); next > 0 {
+	if next := s.recvSeq.Load(); next > 0 {
 		return next - 1
 	}
 	return 0
@@ -1321,7 +1325,7 @@ func (s *clientSession) reackDuplicateData() {
 
 // encodeRecord assigns a fresh packet number and seals the record.
 func (s *clientSession) encodeRecord(r *Record) []byte {
-	r.PacketNo = atomic.AddUint64(&s.sendPacketNo, 1)
+	r.PacketNo = s.sendPacketNo.Add(1)
 	if r.PacketNo == 0 || s.frameKeys == nil {
 		return nil
 	}

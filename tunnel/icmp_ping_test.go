@@ -333,7 +333,7 @@ func TestPingPumpEndsWhenTheConnCloses(t *testing.T) {
 func TestParsePingGroupRange(t *testing.T) {
 	cases := []struct {
 		in          string
-		min, max    int
+		min, max    int64 // int64 so 4294967295 fits on 32-bit platforms too
 		ok          bool
 		description string
 	}{
@@ -349,7 +349,7 @@ func TestParsePingGroupRange(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.description, func(t *testing.T) {
 			min, max, ok := parsePingGroupRange(tc.in)
-			if ok != tc.ok || (ok && (min != tc.min || max != tc.max)) {
+			if ok != tc.ok || (ok && (int64(min) != tc.min || int64(max) != tc.max)) {
 				t.Fatalf("parsePingGroupRange(%q) = %d, %d, %t; want %d, %d, %t",
 					tc.in, min, max, ok, tc.min, tc.max, tc.ok)
 			}
