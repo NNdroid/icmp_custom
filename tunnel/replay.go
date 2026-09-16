@@ -56,18 +56,33 @@ func (rf *ReplayFilter) acceptLocked(seq uint64) bool {
 	if seq > rf.maxSeq {
 		diff := seq - rf.maxSeq
 		if diff >= replayWindowBits {
+			// The whole window fell behind: reset and accept the new head.
 			rf.window = [replayWindowBits / 64]uint64{}
 		} else {
-			for diff > 0 {
-				step := diff
-				if step > 64 {
-					step = 64
+			wordShift := diff / 64
+			bitShift := diff % 64
+			if wordShift > 0 {
+				// Advance whole words: high words fall out of the window and
+				// the low words become zero.
+				ws := int(wordShift)
+				copy(rf.window[ws:], rf.window[:len(rf.window)-ws])
+				for i := 0; i < ws; i++ {
+					rf.window[i] = 0
 				}
-				for i := len(rf.window) - 1; i > 0; i-- {
-					rf.window[i] = (rf.window[i] << step) | (rf.window[i-1] >> (64 - step))
+			}
+			if bitShift > 0 {
+				// Bit-level shift with carry from the word below, iterating
+				// LOW word to HIGH so a word is read before the carry it
+				// supplies to the next word is consumed. A non-constant shift
+				// count in Go is taken modulo the operand width, so we keep
+				// bitShift strictly below 64 (never shift by 64, which would
+				// otherwise be a no-op and corrupt the window).
+				var carry uint64
+				for i := 0; i < len(rf.window); i++ {
+					top := rf.window[i] >> (64 - bitShift)
+					rf.window[i] = (rf.window[i] << bitShift) | carry
+					carry = top
 				}
-				rf.window[0] <<= step
-				diff -= step
 			}
 		}
 		rf.maxSeq = seq

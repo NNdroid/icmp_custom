@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // The Android ping-socket carrier: LOGIC layer.
@@ -182,6 +183,7 @@ func selfFsgid(fallback int) int {
 func (p *pingICMP) pump(s *pingSocket) {
 	defer p.pumps.Done()
 	buf := make([]byte, pingReadBufSize)
+	var consecErr int
 	for {
 		n, from, err := s.conn.ReadFrom(buf)
 		if err != nil {
@@ -191,8 +193,21 @@ func (p *pingICMP) pump(s *pingSocket) {
 			// Per-read errors on a ping socket are routinely transient (an
 			// ICMP error queued for a probe that already gave up). Only a
 			// closed socket ends the pump.
+			//
+			// A socket that keeps erroring without blocking would otherwise
+			// spin this loop at 100% CPU; back off after a burst of
+			// consecutive errors so the scheduler can breathe.
+			consecErr++
+			if consecErr > 10 {
+				backoff := time.Duration(consecErr-10) * 5 * time.Millisecond
+				if backoff > 500*time.Millisecond {
+					backoff = 500 * time.Millisecond
+				}
+				time.Sleep(backoff)
+			}
 			continue
 		}
+		consecErr = 0
 		echo, ok := parseICMPMessage(buf[:n], s.family)
 		if !ok {
 			continue

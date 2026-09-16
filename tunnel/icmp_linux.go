@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -277,6 +278,7 @@ func interpretRawOpenError(err error, family int) error {
 func (r *rawICMP) pump(s *rawSocket) {
 	defer r.pumps.Done()
 	buf := make([]byte, rawReadBufSize)
+	var consecErr int
 	for {
 		n, from, err := s.conn.ReadFromIP(buf)
 		if err != nil {
@@ -286,8 +288,21 @@ func (r *rawICMP) pump(s *rawSocket) {
 			// A per-read error on a raw socket is routinely transient (a
 			// queued ICMP error for a socket that has gone, an oversized
 			// datagram). Only a closed socket ends the pump.
+			//
+			// A socket that keeps erroring without blocking would otherwise
+			// spin this loop at 100% CPU; back off after a burst of
+			// consecutive errors so the scheduler can breathe.
+			consecErr++
+			if consecErr > 10 {
+				backoff := time.Duration(consecErr-10) * 5 * time.Millisecond
+				if backoff > 500*time.Millisecond {
+					backoff = 500 * time.Millisecond
+				}
+				time.Sleep(backoff)
+			}
 			continue
 		}
+		consecErr = 0
 		echo, ok := s.parse(buf[:n])
 		if !ok {
 			continue

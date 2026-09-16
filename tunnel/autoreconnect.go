@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -73,8 +74,10 @@ func (a *AutoReconnect) ensure() (net.Conn, error) {
 		return conn, nil
 	}
 	isReconnect := a.needsRestart
+	var backoff time.Duration
 	if isReconnect {
 		a.reconnectAttempts++
+		backoff = reconnectBackoff(a.reconnectAttempts)
 		a.client.events.emit(ClientEvent{
 			Kind:    Reconnecting,
 			Attempt: int(a.reconnectAttempts),
@@ -82,6 +85,17 @@ func (a *AutoReconnect) ensure() (net.Conn, error) {
 		})
 	}
 	a.mu.Unlock()
+
+	// Back off before redialing so a server that is down or rejecting us is
+	// not hammered by a tight Read/Write loop. Only dialMu is held during the
+	// wait, so other operations fail fast instead of piling up behind it.
+	if isReconnect && backoff > 0 {
+		select {
+		case <-time.After(backoff):
+		case <-a.ctx.Done():
+			return nil, a.ctx.Err()
+		}
+	}
 
 	appConn, _, err := a.client.dialSession(a.ctx, a.opts)
 	if err != nil {
@@ -236,6 +250,25 @@ func (pipeAddr) Network() string { return "icmp" }
 func (pipeAddr) String() string  { return "icmp-tunnel" }
 
 var _ net.Conn = (*AutoReconnect)(nil)
+
+// reconnectBackoff returns an exponential backoff (with jitter) for the given
+// 1-based consecutive failure count, capped so a sustained outage does not
+// stall recovery indefinitely once the server returns.
+func reconnectBackoff(attempts uint64) time.Duration {
+	const base = 200 * time.Millisecond
+	const maxBackoff = 10 * time.Second
+	b := base
+	for i := uint64(1); i < attempts; i++ {
+		b *= 2
+		if b >= maxBackoff {
+			b = maxBackoff
+			break
+		}
+	}
+	// Jitter up to 50% so many wrappers do not reconnect in lockstep.
+	j := time.Duration(rand.Int63n(int64(b / 2)))
+	return b + j
+}
 
 // dialSession establishes one tunnel session and returns its local end —
 // DialTunnel's per-call body, split out so AutoReconnect can re-dial.

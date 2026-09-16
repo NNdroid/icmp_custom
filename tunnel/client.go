@@ -34,6 +34,10 @@ const (
 	clientRecvTimeout          = 75 * time.Second // > the server's 60s idle cleanup
 	clientMaxRetries           = 15
 	clientRetransmitInterval   = 50 * time.Millisecond
+	// Bound the time a stalled application reader may pin this client's single
+	// shared receive loop. The server retransmits unacknowledged data, so a
+	// delivery dropped here is self-healing.
+	clientAppWriteTimeout = 5 * time.Second
 )
 
 // Defaults for the request-driven poll scheduler.
@@ -578,6 +582,7 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 	}
 	sess.sendSeq.Store(1)
 	sess.recvSeq.Store(1)
+	sess.unackedLow = 1
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	c.sessions.Store(sid, sess)
 	c.logInfo("[Client] [Session 0x%08X] tunnel established", sid)
@@ -862,6 +867,7 @@ type clientSession struct {
 	recvMu    sync.Mutex
 
 	unacked     map[uint64]*unackedPkt
+	unackedLow  uint64 // lowest still-unacked seq; the unacked map is contiguous [unackedLow, max]
 	unackedMu   sync.Mutex
 	unackedCond *sync.Cond
 
@@ -929,20 +935,22 @@ func (s *clientSession) close() {
 // Echo Request and the answer arrives as its Echo Reply; the emission is
 // counted so the poll loop knows how many requests are outstanding.
 func (s *clientSession) poke(wire []byte) error {
-	p := pollerOf(s.client.tr)
-	if p == nil {
-		return s.client.tr.WriteRecord(wire, s.client.serverAddr)
-	}
-	if _, err := p.Poke(wire, s.client.serverAddr); err != nil {
-		return err
-	}
+	// Count the attempt up front (before the carrier send) so the in-flight
+	// window reflects every request we emitted — including ones the carrier
+	// dropped. maybePoll relies on poke being the single place poked grows.
 	s.pollMu.Lock()
 	s.poked++
 	if s.poked-s.answered == 1 {
 		s.windowStart = time.Now()
 	}
 	s.pollMu.Unlock()
-	return nil
+
+	p := pollerOf(s.client.tr)
+	if p == nil {
+		return s.client.tr.WriteRecord(wire, s.client.serverAddr)
+	}
+	_, err := p.Poke(wire, s.client.serverAddr)
+	return err
 }
 
 // noteAnswered records that one carrier answer arrived, freeing window space.
@@ -1047,7 +1055,7 @@ func (s *clientSession) sendData(payload []byte) error {
 
 func (s *clientSession) handleAck(ackSeq uint64) {
 	s.unackedMu.Lock()
-	// Cumulative, mirroring the server: everything up to ackSeq is delivered.
+	// Sample RTT from the exact record only when it was never retransmitted.
 	if pkt, ok := s.unacked[ackSeq]; ok && pkt.retries == 0 {
 		s.rttEst.Sample(time.Since(pkt.firstSent))
 	}
@@ -1055,13 +1063,21 @@ func (s *clientSession) handleAck(ackSeq uint64) {
 	// never-retransmitted records count: a retransmitted one proves the path is
 	// marginal at that size, not that it is roomy.
 	fed := s.client.mtuFed
-	for seq, pkt := range s.unacked {
-		if seq <= ackSeq {
-			if fed != nil && pkt.retries == 0 {
-				fed.RecordAcked(len(pkt.wire))
-			}
-			delete(s.unacked, seq)
+	// Cumulative ACK: retire every outstanding seq up to ackSeq. Iterate the
+	// acknowledged range directly instead of scanning the whole unacked map, so
+	// the cost grows with bytes just delivered instead of the send window.
+	for seq := s.unackedLow; seq <= ackSeq; seq++ {
+		pkt, ok := s.unacked[seq]
+		if !ok {
+			continue
 		}
+		if fed != nil && pkt.retries == 0 {
+			fed.RecordAcked(len(pkt.wire))
+		}
+		delete(s.unacked, seq)
+	}
+	if s.unackedLow <= ackSeq {
+		s.unackedLow = ackSeq + 1
 	}
 	s.unackedMu.Unlock()
 	if s.unackedCond != nil {
@@ -1085,6 +1101,12 @@ func (s *clientSession) retransmitLoop() {
 			// us. Re-read each tick because it moves with the classification.
 			floor := rtoFloorOf(s.client.tr)
 			fed := s.client.mtuFed
+			// Collect the records due for retransmission under the lock, then
+			// send them OUTSIDE it: poke() takes pollMu and can block on the
+			// carrier, and holding unackedMu across that would stall every
+			// sender parked on the send window.
+			var toSend []*unackedPkt
+			abandon := false
 			s.unackedMu.Lock()
 			for seq, pkt := range s.unacked {
 				wait := pkt.rto
@@ -1102,15 +1124,22 @@ func (s *clientSession) retransmitLoop() {
 						// exhausted its retransmissions at that size.
 						fed.RecordLost(len(pkt.wire))
 					}
-					s.unackedMu.Unlock()
-					s.closeWithReason("max retransmits exceeded")
-					return
+					delete(s.unacked, seq)
+					abandon = true
+					break
 				}
 				pkt.sentTime = now
 				pkt.rto = minDuration(pkt.rto*3/2, 10*time.Second)
-				_ = s.poke(pkt.wire)
+				toSend = append(toSend, pkt)
 			}
 			s.unackedMu.Unlock()
+			if abandon {
+				s.closeWithReason("max retransmits exceeded")
+				return
+			}
+			for _, pkt := range toSend {
+				_ = s.poke(pkt.wire)
+			}
 
 			s.mu.Lock()
 			idle := now.Sub(s.lastActive)
@@ -1199,7 +1228,10 @@ func (s *clientSession) pollLoop() {
 // fully black-holed window would stop polling forever and never recover).
 func (s *clientSession) maybePoll(stall time.Duration) {
 	s.pollMu.Lock()
-	if outstanding := s.poked - s.answered; int(outstanding) >= s.client.cfg.pollsInFlight() {
+	// Signed subtraction: a late answer can transiently make answered exceed
+	// poked, and an unsigned wrap would otherwise report a huge in-flight
+	// count and spuriously refill the window.
+	if outstanding := int64(s.poked) - int64(s.answered); outstanding >= int64(s.client.cfg.pollsInFlight()) {
 		if time.Since(s.windowStart) < stall {
 			s.pollMu.Unlock()
 			return
@@ -1208,12 +1240,11 @@ func (s *clientSession) maybePoll(stall time.Duration) {
 		s.poked = s.answered
 		s.windowStart = time.Now()
 	}
-	if s.poked == s.answered {
-		s.windowStart = time.Now()
-	}
-	s.poked++
 	s.pollMu.Unlock()
 
+	// poke() is the only place poked grows; it also (re)arms windowStart when
+	// this poll opens the in-flight window, so no manual increment is needed
+	// here.
 	ping := &Record{
 		Magic: s.client.magic, Version: Version, Cmd: CmdPing,
 		SessionID: s.sid, Ack: s.currentAck(),
@@ -1227,30 +1258,39 @@ func (s *clientSession) handleData(rec *Record) bool {
 	if rec.Seq == 0 {
 		return true
 	}
-	s.recvMu.Lock()
-	defer s.recvMu.Unlock()
 
+	s.recvMu.Lock()
 	payload := rec.Data
 	expected := s.recvSeq.Load()
 	if rec.Seq != expected {
 		if rec.Seq < expected {
 			// Already delivered: the server is retransmitting because it lost
 			// our ACK, so re-ACK instead of dropping it.
-			s.sendACK(expected - 1)
+			ackSeq := expected - 1
+			s.recvMu.Unlock()
+			s.sendACK(ackSeq)
 			return true
 		}
 		if _, dup := s.recvQueue[rec.Seq]; dup {
+			s.recvMu.Unlock()
 			return true
 		}
 		if len(s.recvQueue) >= 512 {
+			s.recvMu.Unlock()
 			return false
 		}
 		s.recvQueue[rec.Seq] = append([]byte(nil), payload...)
 		s.touch()
+		s.recvMu.Unlock()
 		return true
 	}
 	s.touch()
 
+	// Collect the in-order contiguous run under the lock, then deliver it
+	// OUTSIDE the lock: s.conn is a synchronous net.Pipe whose write blocks
+	// until the application reads, and sendACK -> poke takes pollMu. Holding
+	// recvMu across either would stall this client's single shared receive
+	// loop (readLoop) and, with it, every other session.
 	type pending struct {
 		seq     uint64
 		payload []byte
@@ -1266,19 +1306,22 @@ func (s *clientSession) handleData(rec *Record) bool {
 		run = append(run, pending{seq: next, payload: raw})
 		next++
 	}
+	delivered := uint64(len(run))
+	ackSeq := expected + delivered - 1
+	s.recvSeq.Store(expected + delivered)
+	s.recvMu.Unlock()
 
-	delivered := uint64(0)
+	// Bound the application write so a stalled reader cannot pin the receive
+	// loop forever. The server retransmits unacknowledged data, so a delivery
+	// dropped here is self-healing.
+	_ = s.conn.SetWriteDeadline(time.Now().Add(clientAppWriteTimeout))
 	for _, p := range run {
 		if err := writeAll(s.conn, p.payload); err != nil {
 			s.closeWithReason("application write failed")
 			return true
 		}
-		delivered++
 	}
-	if delivered > 0 {
-		s.recvSeq.Store(expected + delivered)
-		s.sendACK(expected + delivered - 1)
-	}
+	s.sendACK(ackSeq)
 	return true
 }
 

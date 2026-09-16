@@ -509,6 +509,7 @@ func (s *Server) handleHandshake(path PathID, rec *Record, matchedPSK string) {
 	}
 	sess.sendSeq.Store(1)
 	sess.recvSeq.Store(1)
+	sess.unackedLow = 1
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	s.sessions.Store(sid, sess)
 
@@ -552,8 +553,26 @@ func (s *Server) handleHandshake(path PathID, rec *Record, matchedPSK string) {
 		Detail:    requestedTarget,
 	})
 
-	go sess.upstreamLoop()
-	go sess.retransmitLoop()
+	// Track the session pumps in the server WaitGroup so Start's Wait (and
+	// thus a clean Close) returns only after they have stopped. Bail if the
+	// server is already shutting down: a target dial already succeeded, but
+	// spawning pumps into a closed server would orphan them.
+	select {
+	case <-s.closeChan:
+		s.sessions.Delete(sid)
+		sess.Close()
+		return
+	default:
+	}
+	s.wg.Add(2)
+	go func() {
+		defer s.wg.Done()
+		sess.upstreamLoop()
+	}()
+	go func() {
+		defer s.wg.Done()
+		sess.retransmitLoop()
+	}()
 }
 
 // allocateSessionID draws a non-zero SessionID not currently in use.
@@ -1073,6 +1092,7 @@ type ServerSession struct {
 	recvMu    sync.Mutex
 
 	unacked     map[uint64]*unackedPkt
+	unackedLow  uint64 // lowest still-unacked seq; the unacked map is contiguous [unackedLow, max]
 	unackedMu   sync.Mutex
 	unackedCond *sync.Cond
 
@@ -1398,13 +1418,20 @@ func (sess *ServerSession) handleAck(ackSeq uint64) {
 	// records that were never retransmitted count: a retransmitted one proves
 	// the path is marginal at that size, not that it is roomy.
 	fed := sess.server.mtuFed
-	for seq, pkt := range sess.unacked {
-		if seq <= ackSeq {
-			if fed != nil && pkt.retries == 0 {
-				fed.RecordAcked(len(pkt.wire))
-			}
-			delete(sess.unacked, seq)
+	// Iterate the acknowledged range directly instead of scanning the whole
+	// unacked map, so the cost grows with bytes just delivered, not the window.
+	for seq := sess.unackedLow; seq <= ackSeq; seq++ {
+		pkt, ok := sess.unacked[seq]
+		if !ok {
+			continue
 		}
+		if fed != nil && pkt.retries == 0 {
+			fed.RecordAcked(len(pkt.wire))
+		}
+		delete(sess.unacked, seq)
+	}
+	if sess.unackedLow <= ackSeq {
+		sess.unackedLow = ackSeq + 1
 	}
 	sess.unackedMu.Unlock()
 	// Free send-window space; broadcast outside the lock so a woken sender does
@@ -1689,6 +1716,12 @@ func (sess *ServerSession) retransmitLoop() {
 			// carrier's classification.
 			floor := rtoFloorOf(sess.server.tr)
 			fed := sess.server.mtuFed
+			// Collect the records due for retransmission under the lock, then
+			// send them OUTSIDE it: sendToSession can block on the carrier, and
+			// holding unackedMu across it would stall the upstream pump parked
+			// on the send window.
+			var toSend []*unackedPkt
+			abandon := false
 			sess.unackedMu.Lock()
 			for seq, pkt := range sess.unacked {
 				wait := pkt.rto
@@ -1707,16 +1740,23 @@ func (sess *ServerSession) retransmitLoop() {
 						// enough for the signal to be trusted).
 						fed.RecordLost(len(pkt.wire))
 					}
-					sess.unackedMu.Unlock()
-					sess.Close()
-					return
+					delete(sess.unacked, seq)
+					abandon = true
+					break
 				}
 				pkt.retries++
 				pkt.sentTime = now
 				pkt.rto = minDuration(pkt.rto*3/2, sess.rttEst.maxRTT)
-				sess.sendToSession(pkt.wire)
+				toSend = append(toSend, pkt)
 			}
 			sess.unackedMu.Unlock()
+			if abandon {
+				sess.Close()
+				return
+			}
+			for _, pkt := range toSend {
+				sess.sendToSession(pkt.wire)
+			}
 		}
 	}
 }

@@ -99,14 +99,14 @@ func (s *discardSink) Read(p []byte) (int, error) {
 		s.mu.Unlock()
 
 		var timeout <-chan time.Time
+		var timer *time.Timer
 		if !deadline.IsZero() {
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
 				return 0, os.ErrDeadlineExceeded
 			}
-			timer := time.NewTimer(remaining)
+			timer = time.NewTimer(remaining)
 			timeout = timer.C
-			defer timer.Stop()
 		}
 
 		select {
@@ -114,7 +114,15 @@ func (s *discardSink) Read(p []byte) (int, error) {
 			// Re-check: the queue may have been drained by another reader, or
 			// the wake may be a stale token.
 		case <-timeout:
+			if timer != nil {
+				timer.Stop()
+			}
 			return 0, os.ErrDeadlineExceeded
+		}
+		// Stop the timer each iteration: a deferred Stop inside the loop would
+		// only run when Read returns, leaking a timer per wake-up.
+		if timer != nil {
+			timer.Stop()
 		}
 	}
 }
