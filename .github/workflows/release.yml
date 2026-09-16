@@ -1,11 +1,25 @@
 name: Release
 
 on:
+  # Manual "Release" button. Auto-computes the version (see below) and publishes.
+  workflow_dispatch:
+  # Every merge/push to main also auto-publishes a release with the computed
+  # version. Remove this block if you do NOT want a release per commit.
   push:
-    tags: ['v*']
+    branches: [main]
 
 permissions:
   contents: write
+
+# Compute the version string: v1.0.<yyyymmdd>.<commit-count>-<short-sha-7>
+# e.g. v1.0.20260916.1234-a1b2c3d
+# Shared by both jobs via $GITHUB_ENV.
+env:
+  VERSION_SCRIPT: |
+    DATE="$(date -u +%Y%m%d)"
+    COUNT="$(git rev-list --count HEAD)"
+    SHA="$(git rev-parse --short=7 HEAD)"
+    echo "VERSION=v1.0.${DATE}.${COUNT}-${SHA}" >> "$GITHUB_ENV"
 
 jobs:
   build:
@@ -29,14 +43,20 @@ jobs:
           - { goos: windows, goarch: arm64, ext: '.exe' }
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history needed so `git rev-list --count HEAD` is meaningful.
+          fetch-depth: 0
+
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.x'
           cache: true
 
+      - name: Compute version
+        run: ${{ env.VERSION_SCRIPT }}
+
       - name: Build
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
           BINARY="icmp_custom${{ matrix.ext }}"
           mkdir -p "dist/icmp_custom-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
           go build -trimpath \
@@ -50,7 +70,6 @@ jobs:
 
       - name: Archive (zip on Windows, tar.gz elsewhere)
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
           NAME="icmp_custom-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
           cd dist
           if [ "${{ matrix.goos }}" = "windows" ]; then
@@ -72,11 +91,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      - name: Compute version
+        run: ${{ env.VERSION_SCRIPT }}
 
       - name: Generate SHA-256 checksums
         run: |
@@ -87,11 +111,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          # Idempotent: a GitHub Release created from the UI/API already makes
-          # the tag and the release, so pushing the tag would re-trigger this
-          # workflow and `gh release create` would fail with "a release with
-          # the same tag name already exists". Detect and attach instead.
+          TAG="${VERSION}"
+          # Idempotent: if a release with this computed tag already exists
+          # (re-run, or created from the UI/API), just (re)upload the assets
+          # instead of failing with "a release with the same tag name already
+          # exists". `gh release create` also auto-creates the git tag.
           if gh release view "${TAG}" >/dev/null 2>&1; then
             echo "Release ${TAG} already exists; uploading assets."
             gh release upload "${TAG}" dist/* --clobber
