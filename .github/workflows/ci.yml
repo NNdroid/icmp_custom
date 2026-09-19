@@ -200,19 +200,25 @@ jobs:
     name: Test on 32-bit (${{ matrix.goarch }} via QEMU)
     needs: lint
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         # These are the GOARCHes where a bare uint64 is only 4-byte aligned, so
         # a 64-bit counter ever downgraded from atomic.Uint64 breaks here and
         # nowhere else. cross-build only COMPILES for these targets, which
-        # catches the alignment assertions; this job EXECUTES the code, which
-        # is the only way to catch a behavioural divergence such as
+        # catches the assertions in tunnel/alignment.go; this job EXECUTES the
+        # code, which is the only way to catch a behavioural divergence such as
         # int(uint32) wrapping at 2^31 (TestDiscardSinkClampsHighBitLengthRequests).
-        - { goarch: 386, qemu: qemu-i386-static }
-        - { goarch: arm, qemu: qemu-arm-static }
-        - { goarch: mipsle, qemu: qemu-mipsel-static }
+        #
+        # strategy.matrix must be a mapping - a bare list here is rejected as a
+        # YAML error ("A sequence was not expected") even though plain YAML
+        # accepts it. include: is the form the cross-build job above already
+        # uses.
+        include:
+          - { goarch: '386', qemu: qemu-i386-static }
+          - { goarch: 'arm', qemu: qemu-arm-static }
+          - { goarch: 'mipsle', qemu: qemu-mipsel-static }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -223,16 +229,50 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-user-static
-      - name: Run the suite under QEMU
+      # The flags mirror the native `test` job so the two are directly
+      # comparable: -count=1 (no cache), -covermode=atomic (the coverage
+      # counters are atomics, so the coverage runtime itself exercises aligned
+      # 64-bit atomics on a 32-bit GOARCH), one profile for every package.
+      #
+      # The one deliberate omission is -race: it is not supported on any 32-bit
+      # GOARCH (`go test -race` reports "-race is not supported on linux/386"),
+      # so the race detector stays with the 64-bit job.
+      #
+      # -exec routes the cross-compiled binaries through the QEMU user-mode
+      # emulator. go test appends -test.gocoverdir/-test.coverprofile to the
+      # arguments it passes, so coverage is collected exactly as it would be
+      # natively. CGO_ENABLED=0 makes the binaries fully static, so they need
+      # no foreign libc under emulation.
+      - name: Test (coverage)
         shell: bash
         run: |
           set -euo pipefail
-          export GOOS=linux
-          export GOARCH=${{ matrix.goarch }}
-          export CGO_ENABLED=0
-          for spec in "root:." "tunnel:./tunnel"; do
-            name="${spec%%:*}"
-            pkg="${spec#*:}"
-            go test -c -trimpath -o "${name}.test" "${pkg}"
-            ${{ matrix.qemu }} "./${name}.test" -test.v -test.timeout 20m
-          done
+          GOOS=linux GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+            go test -count=1 -test.timeout 30m \
+              -coverprofile=coverage.txt -covermode=atomic \
+              -exec '${{ matrix.qemu }}' ./... 2>&1 | tee test-output.txt
+      # -benchtime 1x: execute every benchmark once just to prove it compiles,
+      # runs and does not panic or hang on a 32-bit GOARCH. The timings are
+      # meaningless under emulation, so they are not comparable with bench-smoke.
+      - name: Run benchmarks (single iteration each)
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOOS=linux GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+            go test -run '^$' -bench . -benchtime 1x -test.timeout 30m \
+              -exec '${{ matrix.qemu }}' ./... 2>&1 | tee bench-output.txt
+      - name: Upload test output (always, for post-mortem)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 32bit-${{ matrix.goarch }}-output
+          path: |
+            test-output.txt
+            bench-output.txt
+          if-no-files-found: ignore
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-32bit-${{ matrix.goarch }}
+          path: coverage.txt
+          if-no-files-found: error
