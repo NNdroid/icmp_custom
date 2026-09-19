@@ -766,6 +766,52 @@ func (b *pokeBook) len() int {
 // Shared carrier core
 // ---------------------------------------------------------------------------
 
+// recentSeqsLen is how many Echo sequence numbers the carrier remembers. A
+// frag-needed normally arrives within one RTT of the packet it quotes, so a
+// window of a few hundred packets is far more than enough, and 128 uint16 is
+// 256 bytes.
+const recentSeqsLen = 128
+
+// recentSeqs is the ring of Echo sequence numbers this carrier has recently
+// put on the wire or accepted from the peer. It is the membership token that
+// gates frag-needed adoption: ICMP errors are unauthenticated, and the one
+// thing an off-path forger cannot know is which sequence numbers are real.
+// On-path attackers see seqs anyway — but they also see the records, whose
+// AEAD they cannot break, so this raises the bar exactly where it is cheap.
+type recentSeqs struct {
+	mu   sync.Mutex
+	ring [recentSeqsLen]uint16
+	n    int // populated slots
+	pos  int // next write slot
+}
+
+func (r *recentSeqs) remember(seq uint16) {
+	if seq == 0 {
+		return
+	}
+	r.mu.Lock()
+	r.ring[r.pos] = seq
+	r.pos = (r.pos + 1) % len(r.ring)
+	if r.n < len(r.ring) {
+		r.n++
+	}
+	r.mu.Unlock()
+}
+
+func (r *recentSeqs) contains(seq uint16) bool {
+	if seq == 0 {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := 0; i < r.n; i++ {
+		if r.ring[i] == seq {
+			return true
+		}
+	}
+	return false
+}
+
 // icmpCore is everything the ICMP profile does that is independent of how a
 // packet leaves the machine: id selection, pacing, the health classifier, and
 // the automatic MTU controller. Both platform carriers delegate to it.
@@ -776,14 +822,16 @@ type icmpCore struct {
 	mon    *carrierMonitor
 	book   *pokeBook
 	logger Logger
+	recent recentSeqs
 
 	probeEnabled bool
 	probeFails   atomic.Int32
 	probeOff     atomic.Bool
 
-	pollsSent   atomic.Uint64
-	repliesSeen atomic.Uint64
-	seq         atomic.Uint32
+	pollsSent     atomic.Uint64
+	repliesSeen   atomic.Uint64
+	seq           atomic.Uint32
+	lastFragAdopt atomic.Int64 // unix nanos of the last adopted frag-needed
 }
 
 func newICMPCore(prof resolvedProfile, peer netip.AddrPort, ids idProvider, logger Logger) *icmpCore {
@@ -804,9 +852,44 @@ func (c *icmpCore) nextSeq() uint16 {
 	for {
 		v := c.seq.Add(1)
 		if s := uint16(v); s != 0 {
+			c.recent.remember(s)
 			return s
 		}
 	}
+}
+
+// fragAdoptMinInterval throttles path-MTU adoption. Real path MTUs change on
+// the scale of route changes, not seconds; a spoofed report storm that survives
+// the seq check (an on-path observer can replay real seqs) must still not move
+// the budget more often than this.
+const fragAdoptMinInterval = time.Second
+
+// adoptPathBudget applies one path-MTU report (frag-needed / Packet Too Big).
+// ICMP errors are unauthenticated, so the report is only trusted when its
+// quoted sequence number belongs to traffic this carrier recently sent or
+// received, and adoption itself is rate-limited: see recentSeqs and
+// fragAdoptMinInterval. A report that fails either check is dropped without
+// touching the budget — the in-band MTU search (method B) keeps working.
+func (c *icmpCore) adoptPathBudget(budget int, quotedSeq uint16) {
+	if budget <= 0 {
+		return
+	}
+	if !c.recent.contains(quotedSeq) {
+		if c.logger != nil {
+			c.logger.Debugf("[ICMP] ignored a path-MTU report (%d): quoted seq %d is not recent traffic",
+				budget, quotedSeq)
+		}
+		return
+	}
+	now := time.Now()
+	last := c.lastFragAdopt.Load()
+	if last != 0 && now.Sub(time.Unix(0, last)) < fragAdoptMinInterval {
+		return
+	}
+	if !c.lastFragAdopt.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	c.mtu.adoptPathBudget(budget)
 }
 
 func (c *icmpCore) waitPace(ctx context.Context) error {
@@ -884,8 +967,6 @@ func (c *icmpCore) recordAcked(size int) { c.mtu.recordAcked(size) }
 
 func (c *icmpCore) recordLost(size int) { c.mtu.recordLost(size) }
 
-func (c *icmpCore) adoptPathBudget(budget int) { c.mtu.adoptPathBudget(budget) }
-
 // adoptProbedBudget applies an active-probe result, which is stronger evidence
 // than in-band guessing.
 func (c *icmpCore) adoptProbedBudget(budget int) { c.mtu.adoptProbed(budget) }
@@ -949,8 +1030,15 @@ type inboundEcho struct {
 	// search ever gets.
 	//
 	// It is a record budget rather than a raw MTU because only the platform
-	// knows which family's header overhead applies.
+	// knows which family's header overhead applies. It only reaches the MTU
+	// controller after the carrier has checked it against recent traffic — see
+	// icmpCore.adoptPathBudget — because ICMP errors are unauthenticated and a
+	// forged one is otherwise a one-packet throughput kill switch.
 	PathBudget int
+	// QuotedSeq is the Echo sequence number of the ORIGINAL packet quoted by a
+	// path-MTU error (zero when absent or not an echo). It is the membership
+	// token for the recent-traffic check that gates PathBudget adoption.
+	QuotedSeq uint16
 }
 
 // platformICMP is the socket side of the carrier: put an Echo on the wire, read
@@ -1047,11 +1135,16 @@ func (t *icmpTransport) ReadRecord(buf []byte) (int, PathID, error) {
 		}
 		if echo.PathBudget > 0 {
 			// A frag-needed message is not a record; it is the one precise
-			// downward signal in the whole MTU search. Adopt it and keep
-			// listening.
-			t.core.adoptPathBudget(echo.PathBudget)
+			// downward signal in the whole MTU search — and unauthenticated,
+			// so adoptPathBudget checks the quoted sequence against recent
+			// traffic before believing it. Adopt or not, keep listening.
+			t.core.adoptPathBudget(echo.PathBudget, echo.QuotedSeq)
 			continue
 		}
+		// Remember the seq this echo carried in BOTH directions: our replies
+		// mirror the peer's request seqs, so a frag-needed quoting our reply
+		// names a seq we only ever saw inbound.
+		t.core.recent.remember(echo.Path.Seq)
 		if echo.IsRequest {
 			// The peer is polling us. Its arrival is itself evidence that the
 			// path works, independent of anything the records say.

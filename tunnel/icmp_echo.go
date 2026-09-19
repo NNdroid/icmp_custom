@@ -130,17 +130,7 @@ func parseICMPMessage(msg []byte, family int) (inboundEcho, bool) {
 			if msg[1] != 4 { // only "fragmentation needed"
 				return inboundEcho{}, false
 			}
-			// RFC 1191 puts the next-hop MTU in the 16 bits at offset 6. A few
-			// implementations zero that and use offset 4 instead, so take
-			// whichever is populated.
-			mtu := int(binary.BigEndian.Uint16(msg[6:8]))
-			if mtu == 0 {
-				mtu = int(binary.BigEndian.Uint16(msg[4:6]))
-			}
-			if mtu < 68 || mtu > 65535 {
-				return inboundEcho{}, false
-			}
-			return inboundEcho{PathBudget: mtu - ipv4HeaderOverhead}, true
+			return parseFragNeeded(msg)
 		}
 	case 6:
 		switch msg[0] {
@@ -151,12 +141,107 @@ func parseICMPMessage(msg []byte, family int) (inboundEcho, bool) {
 				IsRequest: msg[0] == 128,
 			}, true
 		case 2: // Packet Too Big
-			mtu := int(binary.BigEndian.Uint32(msg[4:8]))
-			if mtu < 1280 || mtu > 1<<20 {
-				return inboundEcho{}, false
-			}
-			return inboundEcho{PathBudget: mtu - ipv6HeaderOverhead}, true
+			return parsePacketTooBig(msg)
 		}
 	}
 	return inboundEcho{}, false
+}
+
+// parseFragNeeded decodes an IPv4 "fragmentation needed" report (RFC 1191).
+// The next-hop MTU sits in the 16 bits at offset 6; a few implementations zero
+// that and use offset 4 instead, so take whichever is populated.
+//
+// ICMP errors are unauthenticated, so this message is a forger's lever on our
+// send budget unless the QUOTED original packet inside it is checked. RFC 792
+// puts the original IP header (plus 64 bits of payload when it fits) in the
+// message body; ours are recognisable, so require exactly that shape before
+// reporting a budget at all:
+//
+//   - a full IPv4 header with no options (version 4, IHL 5 — we never emit
+//     options), carrying protocol 1 (ICMP);
+//   - the quoted datagram's first 8 bytes must be an ICMP echo header (type 0
+//     or 8) — its sequence number is what the carrier cross-checks against
+//     traffic it recently sent or received.
+//
+// A report that fails any of these is not ours (or not real) and is dropped;
+// the in-band MTU search keeps working without it.
+func parseFragNeeded(msg []byte) (inboundEcho, bool) {
+	quoted, ok := quotedIPv4Echo(msg)
+	if !ok {
+		return inboundEcho{}, false
+	}
+	mtu := int(binary.BigEndian.Uint16(msg[6:8]))
+	if mtu == 0 {
+		mtu = int(binary.BigEndian.Uint16(msg[4:6]))
+	}
+	if mtu < 68 || mtu > 65535 {
+		return inboundEcho{}, false
+	}
+	return inboundEcho{
+		PathBudget: mtu - ipv4HeaderOverhead,
+		QuotedSeq:  binary.BigEndian.Uint16(quoted[6:8]),
+	}, true
+}
+
+// parsePacketTooBig is the IPv6 counterpart (RFC 4443 type 2): the MTU is the
+// full 32 bits at offset 4, and the quoted original packet is an IPv6 header
+// (always 40 bytes, no IHL subtleties) whose next-header field must be 58
+// (ICMPv6) and whose first body bytes must look like our echo header. The same
+// forgery logic as parseFragNeeded applies.
+func parsePacketTooBig(msg []byte) (inboundEcho, bool) {
+	const ipv6HeaderLen = 40
+	if len(msg) < 8+ipv6HeaderLen {
+		return inboundEcho{}, false
+	}
+	quotedIP := msg[8:]
+	if quotedIP[0]>>4 != 6 {
+		return inboundEcho{}, false
+	}
+	if quotedIP[6] != 58 { // next-header: ICMPv6
+		return inboundEcho{}, false
+	}
+	if len(msg) < 8+ipv6HeaderLen+8 {
+		return inboundEcho{}, false
+	}
+	quotedEcho := quotedIP[ipv6HeaderLen:][:8]
+	if t := quotedEcho[0]; t != 0 && t != 128 && t != 129 {
+		return inboundEcho{}, false
+	}
+	mtu := int(binary.BigEndian.Uint32(msg[4:8]))
+	if mtu < 1280 || mtu > 1<<20 {
+		return inboundEcho{}, false
+	}
+	return inboundEcho{
+		PathBudget: mtu - ipv6HeaderOverhead,
+		QuotedSeq:  binary.BigEndian.Uint16(quotedEcho[6:8]),
+	}, true
+}
+
+// quotedIPv4Echo validates and returns the 8-byte quoted echo header inside a
+// received IPv4 ICMP error: msg is the full ICMP error (header + payload), the
+// quoted packet starts at offset 8, and it must be a 20-byte (no options)
+// IPv4 header for protocol ICMP whose payload begins with an echo header.
+func quotedIPv4Echo(msg []byte) ([]byte, bool) {
+	const ipv4HeaderLen = 20
+	if len(msg) < 8+ipv4HeaderLen {
+		return nil, false
+	}
+	ip := msg[8:]
+	if ip[0]>>4 != 4 { // version
+		return nil, false
+	}
+	if ihl := int(ip[0]&0x0f) * 4; ihl != ipv4HeaderLen { // we never send options
+		return nil, false
+	}
+	if ip[9] != 1 { // protocol: ICMP
+		return nil, false
+	}
+	if len(msg) < 8+ipv4HeaderLen+8 {
+		return nil, false
+	}
+	echo := ip[ipv4HeaderLen:][:8]
+	if t := echo[0]; t != 0 && t != 8 { // the quoted datagram must be OUR echo
+		return nil, false
+	}
+	return echo, true
 }

@@ -937,10 +937,17 @@ func (c *synCache) Abort(key synCacheKey) {
 	c.mu.Unlock()
 }
 
+// makeSpaceLocked frees room for a new entry. The TTL sweep is O(n) over the
+// whole table, so it only runs under pressure (the table is at its cap); with
+// room to spare, expired entries are left alone — a lookup of one TTL-checks
+// and deletes it, and the FIFO eviction below keeps the table bounded. The
+// common handshake path therefore costs O(1), not a scan of 4096 entries.
 func (c *synCache) makeSpaceLocked(now time.Time) {
-	for key, rec := range c.entries {
-		if now.Sub(rec.createdAt) > synCacheTTL {
-			delete(c.entries, key)
+	if len(c.entries) >= synCacheMax {
+		for key, rec := range c.entries {
+			if now.Sub(rec.createdAt) > synCacheTTL {
+				delete(c.entries, key)
+			}
 		}
 	}
 	for len(c.entries) >= synCacheMax && len(c.fifo) > 0 {

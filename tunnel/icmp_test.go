@@ -1069,10 +1069,14 @@ func TestICMPTransportAdoptsAnInbandPathBudget(t *testing.T) {
 	tr, plat := newTestICMPTransport(t, ICMPProfile{
 		MaxPayload: 1452, MTUMode: "auto", PaceMS: 1,
 	}, Nop{})
+	core := tr.core
 
 	// A frag-needed report carries no record; the reader must adopt it and keep
-	// waiting rather than hand back an empty payload.
-	plat.incoming <- inboundEcho{PathBudget: 1000}
+	// waiting rather than hand back an empty payload. ICMP errors are
+	// unauthenticated, so adoption only happens for a report whose quoted
+	// sequence number belongs to traffic this carrier actually handled.
+	seq := core.nextSeq() // a seq the carrier recently put on the wire
+	plat.incoming <- inboundEcho{PathBudget: 1000, QuotedSeq: seq}
 	plat.incoming <- inboundEcho{Payload: []byte("a record"), Path: PathID{Seq: 7}}
 
 	buf := make([]byte, 1472)
@@ -1085,6 +1089,28 @@ func TestICMPTransportAdoptsAnInbandPathBudget(t *testing.T) {
 	}
 	if got := tr.MaxRecordSize(); got != 1000 {
 		t.Fatalf("send budget = %d, want the adopted path budget 1000", got)
+	}
+
+	// A forged report quoting a sequence number the carrier never sent or
+	// received must not move the budget.
+	plat.incoming <- inboundEcho{PathBudget: 600, QuotedSeq: 42424}
+	plat.incoming <- inboundEcho{Payload: []byte("b record"), Path: PathID{Seq: 8}}
+	if _, _, err := tr.ReadRecord(buf); err != nil {
+		t.Fatalf("ReadRecord (second): %v", err)
+	}
+	if got := tr.MaxRecordSize(); got != 1000 {
+		t.Fatalf("a forged frag-needed moved the budget to %d; it must stay 1000", got)
+	}
+
+	// Even a genuine report is rate-limited: one adoption per interval.
+	seq2 := core.nextSeq()
+	plat.incoming <- inboundEcho{PathBudget: 900, QuotedSeq: seq2}
+	plat.incoming <- inboundEcho{Payload: []byte("c record"), Path: PathID{Seq: 9}}
+	if _, _, err := tr.ReadRecord(buf); err != nil {
+		t.Fatalf("ReadRecord (third): %v", err)
+	}
+	if got := tr.MaxRecordSize(); got != 1000 {
+		t.Fatalf("a rate-limited frag-needed moved the budget to %d; it must stay 1000", got)
 	}
 }
 

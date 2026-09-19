@@ -212,12 +212,10 @@ func TestPingPumpDropsJunkAndBudgetOnlyMessagesReachReadEcho(t *testing.T) {
 	// Junk first, then a bare frag-needed report (PathBudget, no payload),
 	// then a real record. The frag-needed report is NOT junk: it is the MTU
 	// search's only precise downward signal, so it is queued too — and it
-	// arrives FIRST, before the record behind it.
+	// arrives FIRST, before the record behind it. It must be shaped the way a
+	// real router shapes one, quoting the original packet.
 	conn.inbound <- []byte{99, 0, 0, 0, 0, 0, 0, 0} // unknown type: dropped
-	frag := make([]byte, 8)
-	frag[0], frag[1] = 3, 4
-	binary.BigEndian.PutUint16(frag[6:8], 1400)
-	conn.inbound <- frag
+	conn.inbound <- buildFragNeeded(1400, 8, 1, 2)
 	conn.inbound <- buildEchoMessage(pingTypeV4Reply, 1, 2, []byte("real"), false)
 
 	budget, err := p.readEcho(make([]byte, testRecordLimit))

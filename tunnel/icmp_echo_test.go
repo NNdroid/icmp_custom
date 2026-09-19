@@ -45,11 +45,46 @@ func TestParseICMPMessageV4EchoRequestAndReply(t *testing.T) {
 	}
 }
 
-func TestParseICMPMessageV4FragmentationNeeded(t *testing.T) {
-	// type 3 code 4, next-hop MTU in the 16 bits at offset 6 (RFC 1191).
-	msg := make([]byte, 8)
+// buildFragNeeded assembles a realistic ICMPv4 "fragmentation needed" message
+// the way a router emits it: the 8-byte ICMP header (type 3, code 4, next-hop
+// MTU at offset 6) quoting a 20-byte IPv4 header — version 4, IHL 5, protocol
+// ICMP — whose payload starts with an 8-byte echo header.
+func buildFragNeeded(nextHopMTU uint16, quotedEchoType byte, quotedIdent, quotedSeq uint16) []byte {
+	msg := make([]byte, 8+20+8)
 	msg[0], msg[1] = 3, 4
-	binary.BigEndian.PutUint16(msg[6:8], 1400)
+	binary.BigEndian.PutUint16(msg[6:8], nextHopMTU)
+	ip := msg[8:]
+	ip[0] = 0x45 // version 4, IHL 5
+	binary.BigEndian.PutUint16(ip[2:4], uint16(len(msg)))
+	ip[9] = 1 // protocol: ICMP
+	echo := ip[20:]
+	echo[0] = quotedEchoType
+	binary.BigEndian.PutUint16(echo[4:6], quotedIdent)
+	binary.BigEndian.PutUint16(echo[6:8], quotedSeq)
+	return msg
+}
+
+// buildPacketTooBig is the ICMPv6 counterpart: type 2 with a 32-bit MTU at
+// offset 4, quoting a 40-byte IPv6 header (version 6, next-header 58) whose
+// payload starts with an 8-byte echo header.
+func buildPacketTooBig(mtu uint32, quotedEchoType byte, quotedIdent, quotedSeq uint16) []byte {
+	msg := make([]byte, 8+40+8)
+	msg[0] = 2
+	binary.BigEndian.PutUint32(msg[4:8], mtu)
+	ip := msg[8:]
+	ip[0] = 0x60 // version 6
+	ip[6] = 58   // next-header: ICMPv6
+	echo := ip[40:]
+	echo[0] = quotedEchoType
+	binary.BigEndian.PutUint16(echo[4:6], quotedIdent)
+	binary.BigEndian.PutUint16(echo[6:8], quotedSeq)
+	return msg
+}
+
+func TestParseICMPMessageV4FragmentationNeeded(t *testing.T) {
+	// type 3 code 4, next-hop MTU in the 16 bits at offset 6 (RFC 1191), with
+	// the quoted original packet a real router would include.
+	msg := buildFragNeeded(1400, 8, 0x1234, 0x0102)
 
 	echo, ok := parseICMPMessage(msg, 4)
 	if !ok {
@@ -60,13 +95,15 @@ func TestParseICMPMessageV4FragmentationNeeded(t *testing.T) {
 	if want := 1400 - ipv4HeaderOverhead; echo.PathBudget != want {
 		t.Fatalf("path budget = %d, want %d", echo.PathBudget, want)
 	}
+	if echo.QuotedSeq != 0x0102 {
+		t.Fatalf("quoted seq = %d, want 0x0102 (the adoption token)", echo.QuotedSeq)
+	}
 	if len(echo.Payload) != 0 {
 		t.Fatalf("a frag-needed message carries no record, got %d bytes", len(echo.Payload))
 	}
 
 	// Some implementations zero offset 6 and use offset 4 instead.
-	alt := make([]byte, 8)
-	alt[0], alt[1] = 3, 4
+	alt := buildFragNeeded(0, 0, 0, 0)
 	binary.BigEndian.PutUint16(alt[4:6], 1300)
 	echo, ok = parseICMPMessage(alt, 4)
 	if !ok || echo.PathBudget != 1300-ipv4HeaderOverhead {
@@ -78,19 +115,47 @@ func TestParseICMPMessageV4RejectsOtherUnreachables(t *testing.T) {
 	// Only "fragmentation needed" carries MTU information; the rest are not
 	// ours and must be dropped rather than guessed at.
 	for _, code := range []byte{0, 1, 3, 5, 9, 13} {
-		msg := make([]byte, 8)
-		msg[0], msg[1] = 3, code
-		binary.BigEndian.PutUint16(msg[6:8], 1400)
+		msg := buildFragNeeded(1400, 8, 1, 1)
+		msg[1] = code
 		if _, ok := parseICMPMessage(msg, 4); ok {
 			t.Fatalf("type 3 code %d must be ignored", code)
 		}
 	}
 	// An implausibly small "MTU" is not a usable path report.
-	msg := make([]byte, 8)
-	msg[0], msg[1] = 3, 4
-	binary.BigEndian.PutUint16(msg[6:8], 40)
-	if _, ok := parseICMPMessage(msg, 4); ok {
+	if _, ok := parseICMPMessage(buildFragNeeded(40, 8, 1, 1), 4); ok {
 		t.Fatal("a next-hop MTU below 68 must be rejected")
+	}
+}
+
+// TestParseICMPMessageV4RejectsForgedFragNeeded pins the anti-forgery checks:
+// ICMP errors are unauthenticated, so anything that does not quote a packet
+// shaped exactly like ours must be dropped instead of moving the send budget.
+func TestParseICMPMessageV4RejectsForgedFragNeeded(t *testing.T) {
+	valid := buildFragNeeded(1400, 8, 1, 1)
+	if _, ok := parseICMPMessage(valid, 4); !ok {
+		t.Fatal("a well-formed frag-needed must parse (sanity)")
+	}
+
+	forge := func(mutate func(msg []byte)) []byte {
+		msg := buildFragNeeded(1400, 8, 1, 1)
+		mutate(msg)
+		return msg
+	}
+	cases := []struct {
+		name string
+		msg  []byte
+	}{
+		{"truncated before the quoted header", valid[:8+19]},
+		{"no quoted echo payload", valid[:8+20]},
+		{"wrong IP version", forge(func(m []byte) { m[8] = 0x65 })},
+		{"IP options present", forge(func(m []byte) { m[8] = 0x46 })},
+		{"quoted protocol is TCP", forge(func(m []byte) { m[8+9] = 6 })},
+		{"quoted type is not an echo", forge(func(m []byte) { m[8+20] = 3 })},
+	}
+	for _, tc := range cases {
+		if _, ok := parseICMPMessage(tc.msg, 4); ok {
+			t.Fatalf("%s: a forged frag-needed must be rejected", tc.name)
+		}
 	}
 }
 
@@ -109,10 +174,9 @@ func TestParseICMPMessageV6EchoAndPacketTooBig(t *testing.T) {
 		t.Fatalf("ICMPv6 type 129 must parse as an Echo Reply (ok=%t)", ok)
 	}
 
-	// Packet Too Big: a 32-bit MTU at offset 4.
-	ptb := make([]byte, 8)
-	ptb[0] = 2
-	binary.BigEndian.PutUint32(ptb[4:8], 1280)
+	// Packet Too Big: a 32-bit MTU at offset 4, quoting an IPv6 header whose
+	// next-header is ICMPv6 and whose payload starts with our echo header.
+	ptb := buildPacketTooBig(1280, 129, 7, 9)
 	echo, ok = parseICMPMessage(ptb, 6)
 	if !ok {
 		t.Fatal("Packet Too Big must parse")
@@ -120,12 +184,32 @@ func TestParseICMPMessageV6EchoAndPacketTooBig(t *testing.T) {
 	if want := 1280 - ipv6HeaderOverhead; echo.PathBudget != want {
 		t.Fatalf("path budget = %d, want %d", echo.PathBudget, want)
 	}
+	if echo.QuotedSeq != 9 {
+		t.Fatalf("quoted seq = %d, want 9 (the adoption token)", echo.QuotedSeq)
+	}
 
-	bad := make([]byte, 8)
-	bad[0] = 2
-	binary.BigEndian.PutUint32(bad[4:8], 1000) // below the IPv6 minimum
+	// Below the IPv6 minimum, but structurally sound: the MTU bound rejects it.
+	bad := buildPacketTooBig(1000, 129, 7, 9)
 	if _, ok := parseICMPMessage(bad, 6); ok {
 		t.Fatal("a Packet Too Big MTU below 1280 must be rejected")
+	}
+
+	// The same anti-forgery checks as the v4 report.
+	forge := func(mutate func(msg []byte)) []byte {
+		msg := buildPacketTooBig(1280, 129, 7, 9)
+		mutate(msg)
+		return msg
+	}
+	for name, msg := range map[string][]byte{
+		"truncated before the quoted header": ptb[:8+39],
+		"no quoted echo payload":             ptb[:8+40],
+		"wrong IP version":                   forge(func(m []byte) { m[8] = 0x40 }),
+		"quoted next-header is TCP":          forge(func(m []byte) { m[8+6] = 6 }),
+		"quoted type is not an echo":         forge(func(m []byte) { m[8+40] = 1 }),
+	} {
+		if _, ok := parseICMPMessage(msg, 6); ok {
+			t.Fatalf("%s: a forged Packet Too Big must be rejected", name)
+		}
 	}
 }
 
