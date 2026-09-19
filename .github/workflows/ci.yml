@@ -96,11 +96,25 @@ jobs:
         include:
           - { goos: linux, goarch: amd64 }
           - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: loong64 }
+          - { goos: linux, goarch: riscv64 }
           - { goos: darwin, goarch: amd64 }
           - { goos: darwin, goarch: arm64 }
           - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+          - { goos: freebsd, goarch: amd64 }
           # The Android ping-socket carrier (P9) must keep compiling.
           - { goos: android, goarch: arm64 }
+          # 32-bit is the point of this matrix. On these GOARCHes a bare
+          # uint64 is only 4-byte aligned, so a 64-bit counter that was ever
+          # downgraded from atomic.Uint64 breaks at runtime. On a 64-bit
+          # GOARCH the assertions in tunnel/alignment.go are no-ops, which is
+          # why 386/arm/mipsle must be built here or that file protects
+          # nothing. mipsle is not a release target but is the harshest
+          # 32-bit alignment case, so it is the one that earns its row.
+          - { goos: linux, goarch: 386 }
+          - { goos: linux, goarch: arm }
+          - { goos: linux, goarch: mipsle }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -112,15 +126,16 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-      # For Android, also compile the TEST files: the ping-socket carrier's
-      # unit tests carry the android build tag and cannot run without a
-      # device, but a compile failure must still break CI.
-      - name: Vet (compiles tests too)
-        if: matrix.goos == 'android'
+      # Vet rather than build only: vet also type-checks the _test.go files,
+      # so a test that stops compiling on a rare architecture still breaks CI.
+      # This is also what actually exercises tunnel/alignment.go - the
+      # alignment assertions fail to compile when they trip, and nothing else
+      # in CI would notice.
+      - name: Vet (also compiles tests)
         run: go vet ./...
         env:
-          GOOS: android
-          GOARCH: arm64
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
 
   android-emulator:
     name: Android emulator (ping socket on a real kernel)
@@ -180,3 +195,44 @@ jobs:
             adb push "$ANDROID_TEST_BIN" /data/local/tmp/
             adb shell chmod 755 /data/local/tmp/"$ANDROID_TEST_BIN"
             adb shell "/data/local/tmp/\"$ANDROID_TEST_BIN\" -test.run 'TestDevicePing|TestPing|TestCheckPingGroupRange|TestParsePingGroupRange|TestSelfFsgid' -test.timeout 10m -test.v"
+
+  test-32bit:
+    name: Test on 32-bit (${{ matrix.goarch }} via QEMU)
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # These are the GOARCHes where a bare uint64 is only 4-byte aligned, so
+        # a 64-bit counter ever downgraded from atomic.Uint64 breaks here and
+        # nowhere else. cross-build only COMPILES for these targets, which
+        # catches the alignment assertions; this job EXECUTES the code, which
+        # is the only way to catch a behavioural divergence such as
+        # int(uint32) wrapping at 2^31 (TestDiscardSinkClampsHighBitLengthRequests).
+        - { goarch: 386, qemu: qemu-i386-static }
+        - { goarch: arm, qemu: qemu-arm-static }
+        - { goarch: mipsle, qemu: qemu-mipsel-static }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - name: Install QEMU user-mode emulation
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+      - name: Run the suite under QEMU
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GOOS=linux
+          export GOARCH=${{ matrix.goarch }}
+          export CGO_ENABLED=0
+          for spec in "root:." "tunnel:./tunnel"; do
+            name="${spec%%:*}"
+            pkg="${spec#*:}"
+            go test -c -trimpath -o "${name}.test" "${pkg}"
+            ${{ matrix.qemu }} "./${name}.test" -test.v -test.timeout 20m
+          done

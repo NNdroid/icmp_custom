@@ -950,6 +950,33 @@ func TestDiscardSinkRejectsZeroAndCapsOversizeFills(t *testing.T) {
 	}
 }
 
+func TestDiscardSinkClampsHighBitLengthRequests(t *testing.T) {
+	s := newDiscardSink()
+	defer s.Close()
+
+	// Encode 2^31 directly as a uint32. Routed through frameLengthRequest this
+	// value would not fit in an int on a 32-bit platform, which is the exact
+	// trap the test below is guarding against.
+	var n [4]byte
+	binary.BigEndian.PutUint32(n[:], 1<<31)
+	framed, err := EncodeMessage(n[:])
+	if err != nil {
+		t.Fatalf("EncodeMessage: %v", err)
+	}
+	if _, err := s.Write(framed); err != nil {
+		t.Fatal(err)
+	}
+
+	// The request must be clamped to the cap, never dropped. int(uint32) wraps
+	// for values >= 2^31 on a 32-bit GOARCH, so an int-based check sends this
+	// request down the "want == 0" path instead of the clamp: the same bytes
+	// were dropped on 386 and honoured on amd64 before the arithmetic was made
+	// unsigned. Run this on linux/386 or it guards nothing.
+	if st := s.stats(); st.Queued != discardMaxFill || st.Dropped != 0 || st.Fills != 1 {
+		t.Fatalf("a >= 2^31 request must be clamped, not dropped: %+v", st)
+	}
+}
+
 func TestDiscardSinkRefusesToQueueBeyondItsBound(t *testing.T) {
 	s := newDiscardSink()
 	defer s.Close()

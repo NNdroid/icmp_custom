@@ -73,10 +73,12 @@ func (rf *ReplayFilter) acceptLocked(seq uint64) bool {
 			if bitShift > 0 {
 				// Bit-level shift with carry from the word below, iterating
 				// LOW word to HIGH so a word is read before the carry it
-				// supplies to the next word is consumed. A non-constant shift
-				// count in Go is taken modulo the operand width, so we keep
-				// bitShift strictly below 64 (never shift by 64, which would
-				// otherwise be a no-op and corrupt the window).
+				// supplies to the next word is consumed.
+				//
+				// bitShift comes from diff % 64 above and stays in [1, 63].
+				// That reduction is load-bearing: Go does not take a shift
+				// count modulo the operand width, so shifting a uint64 by 64
+				// is not a no-op - it yields zero and would wipe the window.
 				var carry uint64
 				for i := 0; i < len(rf.window); i++ {
 					top := rf.window[i] >> (64 - bitShift)

@@ -207,12 +207,16 @@ func parsePacketTooBig(msg []byte) (inboundEcho, bool) {
 	if t := quotedEcho[0]; t != 0 && t != 128 && t != 129 {
 		return inboundEcho{}, false
 	}
-	mtu := int(binary.BigEndian.Uint32(msg[4:8]))
-	if mtu < 1280 || mtu > 1<<20 {
+	// Validate the wire value while it is still a uint32, then narrow. On a
+	// 32-bit platform int(uint32) wraps for values >= 2^31, so narrowing first
+	// would reject an out-of-range MTU through the wrong condition (mtu < 1280
+	// instead of mtu > 1<<20) and make the check architecture-dependent.
+	mtuU := binary.BigEndian.Uint32(msg[4:8])
+	if mtuU < 1280 || mtuU > 1<<20 {
 		return inboundEcho{}, false
 	}
 	return inboundEcho{
-		PathBudget: mtu - ipv6HeaderOverhead,
+		PathBudget: int(mtuU) - ipv6HeaderOverhead,
 		QuotedSeq:  binary.BigEndian.Uint16(quotedEcho[6:8]),
 	}, true
 }

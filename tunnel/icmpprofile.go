@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -342,8 +343,11 @@ func randomUint32() uint32 {
 	if _, err := rand.Read(b[:]); err != nil {
 		// crypto/rand does not fail on supported platforms; if it somehow
 		// does, a time-derived value is still better than a constant that
-		// would collide across every tunnel.
-		return uint32(time.Now().UnixNano())
+		// would collide across every tunnel. UnixNano is already past 2^60,
+		// so fold the high bits in rather than truncating to the low 32: that
+		// would leave only sub-microsecond noise to tell tunnels apart.
+		now := time.Now().UnixNano()
+		return uint32(now) ^ uint32(now>>32) ^ uint32(os.Getpid())
 	}
 	return binary.BigEndian.Uint32(b[:])
 }

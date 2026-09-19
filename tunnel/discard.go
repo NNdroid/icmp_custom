@@ -148,18 +148,24 @@ func (s *discardSink) Write(p []byte) (int, error) {
 			s.dropped++
 			continue
 		}
-		want := int(binary.BigEndian.Uint32(msg))
+		// The wire value is a uint32 and the arithmetic stays unsigned. On a
+		// 32-bit platform int(uint32) wraps for values >= 2^31, which would
+		// land in the "want == 0" branch below instead of the clamp and
+		// silently drop a request that a 64-bit host accepts. discardMaxFill
+		// keeps want small enough that the final int(want) is exact on every
+		// GOARCH.
+		want := binary.BigEndian.Uint32(msg)
 		switch {
-		case want <= 0:
+		case want == 0:
 			s.dropped++
 			continue
 		case want > discardMaxFill:
 			want = discardMaxFill
-		case len(s.out)+want > discardMaxQueued:
+		case uint32(len(s.out))+want > discardMaxQueued:
 			s.dropped++
 			continue
 		}
-		s.out = append(s.out, make([]byte, want)...)
+		s.out = append(s.out, make([]byte, int(want))...)
 		s.fills++
 		wake = true
 	}
