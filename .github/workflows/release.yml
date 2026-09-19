@@ -1,25 +1,33 @@
 name: Release
 
 on:
-  # Manual "Release" button. Auto-computes the version (see below) and publishes.
+  # Manual "Release" button. Publishes for the computed version below - the
+  # only way to cut a release without pushing a tag first.
   workflow_dispatch:
-  # Every merge/push to main also auto-publishes a release with the computed
-  # version. Remove this block if you do NOT want a release per commit.
+  # Tag-driven: pushing a v1.0.* tag cuts the release for that tag. The tag
+  # name IS the version, so nothing is computed on this path. v1.1.0 and
+  # v2.0.0 do not match and will not publish.
   push:
-    branches: [main]
+    tags: ['v1.0.*']
 
 permissions:
   contents: write
 
-# Compute the version string: v1.0.<yyyymmdd>.<commit-count>-<short-sha-7>
-# e.g. v1.0.20260916.1234-a1b2c3d
+# Resolve the version. The normal path is a v1.0.* tag push, where the tag name
+# IS the version - nothing is computed. Only a manual run has no tag, and there
+# the version is computed as v1.0.<yyyymmdd>.<commit-count>-<short-sha-7>,
+# e.g. v1.0.20260916.1234-a1b2c3d.
 # Shared by both jobs via $GITHUB_ENV.
 env:
   VERSION_SCRIPT: |
-    DATE="$(date -u +%Y%m%d)"
-    COUNT="$(git rev-list --count HEAD)"
-    SHA="$(git rev-parse --short=7 HEAD)"
-    echo "VERSION=v1.0.${DATE}.${COUNT}-${SHA}" >> "$GITHUB_ENV"
+    if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+      echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+    else
+      DATE="$(date -u +%Y%m%d)"
+      COUNT="$(git rev-list --count HEAD)"
+      SHA="$(git rev-parse --short=7 HEAD)"
+      echo "VERSION=v1.0.${DATE}.${COUNT}-${SHA}" >> "$GITHUB_ENV"
+    fi
 
 jobs:
   build:
@@ -104,10 +112,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${VERSION}"
-          # Idempotent: if a release with this computed tag already exists
-          # (re-run, or created from the UI/API), just (re)upload the assets
-          # instead of failing with "a release with the same tag name already
-          # exists". `gh release create` also auto-creates the git tag.
+          # Idempotent: if a release for this tag already exists (a re-run of
+          # the same tag push, or a release created from the UI/API), just
+          # (re)upload the assets instead of failing with "a release with the
+          # same tag name already exists".
+          #
+          # On the tag-push path the tag already exists, so this only creates
+          # the release. A manual run has no tag, and there `gh release
+          # create` creates it too.
           if gh release view "${TAG}" >/dev/null 2>&1; then
             echo "Release ${TAG} already exists; uploading assets."
             gh release upload "${TAG}" dist/* --clobber
