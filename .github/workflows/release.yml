@@ -55,29 +55,21 @@ jobs:
       - name: Compute version
         run: ${{ env.VERSION_SCRIPT }}
 
+      # The binary is published as a release asset directly, with no wrapper
+      # archive. The filename already carries the version, GOOS and GOARCH, so
+      # the asset name is self-describing and there is nothing to unpack.
       - name: Build
         run: |
-          BINARY="icmp_custom${{ matrix.ext }}"
-          mkdir -p "dist/icmp_custom-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p dist
+          BINARY="icmp_custom-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
           go build -trimpath \
             -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${GITHUB_SHA} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            -o "dist/icmp_custom-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}/${BINARY}" \
+            -o "dist/${BINARY}" \
             .
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
-
-      - name: Archive (zip on Windows, tar.gz elsewhere)
-        run: |
-          NAME="icmp_custom-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
-          cd dist
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            zip -r "${NAME}.zip" "${NAME}"
-          else
-            tar -czf "${NAME}.tar.gz" "${NAME}"
-          fi
-          rm -rf "${NAME}"
 
       - uses: actions/upload-artifact@v4
         with:

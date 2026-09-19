@@ -5,7 +5,10 @@
 # Usage:
 #   ./scripts/build.sh [version]     # default version: dev
 #
-# Output: bin/icmp_custom-<version>-<os>-<arch>.tar.gz|.zip + checksums
+# Output: bin/icmp_custom-<version>-<os>-<arch>[.exe] + checksums-sha256.txt
+# Binaries are emitted directly, never wrapped in an archive - the release
+# publishes them as assets by name, so the wrapper would only add an unpack
+# step and a second hash to keep in step.
 set -euo pipefail
 
 VERSION="${1:-dev}"
@@ -35,26 +38,11 @@ for target in "${TARGETS[@]}"; do
   read -r goos goarch <<<"${target}"
   ext=""
   [ "${goos}" = "windows" ] && ext=".exe"
-  name="icmp_custom-${VERSION}-${goos}-${goarch}"
-  out="bin/${name}"
+  out="bin/icmp_custom-${VERSION}-${goos}-${goarch}${ext}"
 
-  echo "==> building ${name}"
-  mkdir -p "${out}"
+  echo "==> building ${out##*/}"
   GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 \
-    go build -trimpath -ldflags "${LDFLAGS}" -o "${out}/icmp_custom${ext}" .
-
-  if [ "${goos}" = "windows" ]; then
-    # zip exists on GitHub runners; fall back to Python's zipfile locally.
-    if command -v zip >/dev/null 2>&1; then
-      (cd bin && zip -qr "${name}.zip" "${name}")
-    else
-      # base_dir keeps the folder inside the archive, same as `zip -r`.
-      (cd bin && python -c "import shutil,sys; shutil.make_archive(sys.argv[1],'zip',base_dir=sys.argv[1])" "${name}")
-    fi
-  else
-    (cd bin && tar -czf "${name}.tar.gz" "${name}")
-  fi
-  rm -rf "${out}"
+    go build -trimpath -ldflags "${LDFLAGS}" -o "${out}" .
 done
 
 (cd bin && sha256sum * > checksums-sha256.txt)

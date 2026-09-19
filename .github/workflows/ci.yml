@@ -112,9 +112,13 @@ jobs:
           # why 386/arm/mipsle must be built here or that file protects
           # nothing. mipsle is not a release target but is the harshest
           # 32-bit alignment case, so it is the one that earns its row.
+          # mips is big-endian - the one 32-bit GOARCH that would expose a
+          # byte-order assumption in the wire encoding, which is what a
+          # network protocol mostly is.
           - { goos: linux, goarch: 386 }
           - { goos: linux, goarch: arm }
           - { goos: linux, goarch: mipsle }
+          - { goos: linux, goarch: mips }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -261,6 +265,18 @@ jobs:
           GOOS=linux GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
             go test -run '^$' -bench . -benchtime 1x -test.timeout 30m \
               -exec '${{ matrix.qemu }}' ./... 2>&1 | tee bench-output.txt
+      # A short fuzz smoke on top of the fixed suite. -fuzztime bounds the
+      # wall clock, and the harness writes anything it finds to the corpus on
+      # disk, so a real regression is a saved input rather than a transient
+      # red run. This is the only step that feeds random inputs to the parser
+      # and MAC code on a 32-bit GOARCH.
+      - name: Fuzz smoke (10s per target)
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOOS=linux GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+            go test -run '^$' -fuzz Fuzz -fuzztime 10s -test.timeout 30m \
+              -exec '${{ matrix.qemu }}' ./tunnel/ 2>&1 | tee fuzz-output.txt
       - name: Upload test output (always, for post-mortem)
         if: always()
         uses: actions/upload-artifact@v4
@@ -269,6 +285,7 @@ jobs:
           path: |
             test-output.txt
             bench-output.txt
+            fuzz-output.txt
           if-no-files-found: ignore
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
