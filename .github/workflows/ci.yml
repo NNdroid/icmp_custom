@@ -270,13 +270,30 @@ jobs:
       # disk, so a real regression is a saved input rather than a transient
       # red run. This is the only step that feeds random inputs to the parser
       # and MAC code on a 32-bit GOARCH.
+      #
+      # -fuzz selects exactly ONE fuzz test, so a regex that matches two
+      # (-fuzz Fuzz matches both FuzzVerifyMACNeverPanics and
+      # FuzzParseNeverPanics) aborts with "will not fuzz, -fuzz matches more
+      # than one fuzz test". Enumerate the targets from the package instead, so
+      # adding a fuzz test is picked up without editing this step.
       - name: Fuzz smoke (10s per target)
         shell: bash
         run: |
           set -euo pipefail
-          GOOS=linux GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
-            go test -run '^$' -fuzz Fuzz -fuzztime 10s -test.timeout 30m \
-              -exec '${{ matrix.qemu }}' ./tunnel/ 2>&1 | tee fuzz-output.txt
+          # Listed natively: -list runs the test binary only to enumerate
+          # names, which do not depend on GOARCH, so there is no point in
+          # emulating it. Every name line starts with "Fuzz"; the trailing
+          # "ok ..." summary does not.
+          mapfile -t targets < <(go test -list '^Fuzz' ./tunnel/ 2>/dev/null \
+            | grep '^Fuzz')
+          echo "fuzz targets: ${targets[*]:-none}"
+          for target in "${targets[@]}"; do
+            echo "=== fuzzing ${target} on linux/${{ matrix.goarch }} ===" \
+              | tee -a fuzz-output.txt
+            GOOS=linux GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+              go test -run '^$' -fuzz "^${target}$" -fuzztime 10s -test.timeout 30m \
+                -exec '${{ matrix.qemu }}' ./tunnel/ 2>&1 | tee -a fuzz-output.txt
+          done
       - name: Upload test output (always, for post-mortem)
         if: always()
         uses: actions/upload-artifact@v4
