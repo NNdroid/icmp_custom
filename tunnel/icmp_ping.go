@@ -110,7 +110,8 @@ func checkPingGroupRange() error {
 	fsgid := selfFsgid(gid)
 	groups, _ := os.Getgroups()
 
-	admitted := func(g int) bool { return g >= min && g <= max }
+	// int64(g): gids are int, the range is int64 (see parsePingGroupRange).
+	admitted := func(g int) bool { return int64(g) >= min && int64(g) <= max }
 	if admitted(gid) || admitted(fsgid) {
 		return nil
 	}
@@ -128,13 +129,19 @@ func checkPingGroupRange() error {
 }
 
 // parsePingGroupRange parses the sysctl's "min max" pair.
-func parsePingGroupRange(s string) (min, max int, ok bool) {
+//
+// int64, not int, because the file is wider than a 32-bit int: "0 4294967295"
+// is legal procfs content and strconv.Atoi rejects it on a 32-bit GOARCH where
+// int is 32 bits. That would read as "unparseable" here and silently skip the
+// pre-flight check instead of reporting the range the kernel has.
+func parsePingGroupRange(s string) (min, max int64, ok bool) {
 	fields := strings.Fields(s)
 	if len(fields) != 2 {
 		return 0, 0, false
 	}
-	min, err1 := strconv.Atoi(fields[0])
-	max, err2 := strconv.Atoi(fields[1])
+	var err1, err2 error
+	min, err1 = strconv.ParseInt(fields[0], 10, 64)
+	max, err2 = strconv.ParseInt(fields[1], 10, 64)
 	if err1 != nil || err2 != nil {
 		return 0, 0, false
 	}
