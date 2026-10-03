@@ -265,8 +265,12 @@ jobs:
           GOOS=linux GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
             go test -run '^$' -bench . -benchtime 1x -test.timeout 30m \
               -exec '${{ matrix.qemu }}' ./... 2>&1 | tee bench-output.txt
-      # A short fuzz smoke on top of the fixed suite. -fuzztime bounds the
-      # wall clock, and the harness writes anything it finds to the corpus on
+      # A fixed-count fuzz smoke on top of the fixed suite. Emulated workers
+      # can report context deadline exceeded when a duration-based fuzz run
+      # stops, even after completing its corpus without a failing input. A
+      # 250000-case budget avoids that shutdown boundary and exceeds the
+      # 169685 cases observed in the failing 10-second ARM run. Test and job
+      # timeouts still bound a stall. The harness writes failures to the corpus on
       # disk, so a real regression is a saved input rather than a transient
       # red run. This is the only step that feeds random inputs to the parser
       # and MAC code on a 32-bit GOARCH.
@@ -276,7 +280,7 @@ jobs:
       # FuzzParseNeverPanics) aborts with "will not fuzz, -fuzz matches more
       # than one fuzz test". Enumerate the targets from the package instead, so
       # adding a fuzz test is picked up without editing this step.
-      - name: Fuzz smoke (10s per target)
+      - name: Fuzz smoke (250000 cases per target)
         shell: bash
         run: |
           set -euo pipefail
@@ -291,7 +295,7 @@ jobs:
             echo "=== fuzzing ${target} on linux/${{ matrix.goarch }} ===" \
               | tee -a fuzz-output.txt
             GOOS=linux GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
-              go test -run '^$' -fuzz "^${target}$" -fuzztime 10s -test.timeout 30m \
+              go test -run '^$' -fuzz "^${target}$" -fuzztime 250000x -test.timeout 30m \
                 -exec '${{ matrix.qemu }}' ./tunnel/ 2>&1 | tee -a fuzz-output.txt
           done
       - name: Upload test output (always, for post-mortem)

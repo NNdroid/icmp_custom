@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -410,6 +411,9 @@ func BenchmarkSessionPollLoop(b *testing.B) {
 		count++
 		sess.noteAnswered()
 		if count == b.N {
+			// Match production close ordering: a ready nanosecond timer can
+			// otherwise win the select even after closeChan is closed.
+			atomic.StoreInt32(&sess.closed, 1)
 			close(sess.closeChan)
 		}
 	}
