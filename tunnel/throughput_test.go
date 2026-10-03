@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime/pprof"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -40,6 +41,14 @@ func BenchmarkTunnelBulkTransfer(b *testing.B) {
 
 func benchmarkTunnelBulk(b *testing.B, direction string, mss, sessions int) {
 	cEp, sEp := newFakeLink("bulk-client", "bulk-server", RecordMinSize+mss)
+	// A blocking memory carrier needs room for both DATA and its ACKs. At four
+	// sessions the generic test rig's 1024 slots equal the DATA window alone;
+	// both receive loops can then block sending ACKs into the opposite inbox.
+	// Keep production send windows unchanged and give both revisions the same
+	// bounded carrier headroom before any goroutine starts.
+	carrierCapacity := 2*sessions*defaultSendWindow + 128
+	cEp.inbox = make(chan fakePacket, carrierCapacity)
+	sEp.inbox = make(chan fakePacket, carrierCapacity)
 	backends := make(chan net.Conn, sessions)
 	srv, err := NewServerWithTransport(ServerConfig{
 		TargetAddr: "tcp://bulk.invalid:1", Passwords: []string{"ci-throughput-psk"}, Logger: Nop{},
@@ -111,6 +120,7 @@ func benchmarkTunnelBulk(b *testing.B, direction string, mss, sessions int) {
 			if err := fn(); err != nil {
 				errors <- err
 				abort.Do(func() {
+					_ = pprof.Lookup("goroutine").WriteTo(os.Stderr, 2)
 					_ = cEp.Close()
 					_ = sEp.Close()
 					for _, conn := range apps {
