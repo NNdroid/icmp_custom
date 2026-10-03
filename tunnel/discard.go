@@ -155,13 +155,12 @@ func (s *discardSink) Write(p []byte) (int, error) {
 		// keeps want small enough that the final int(want) is exact on every
 		// GOARCH.
 		want := binary.BigEndian.Uint32(msg)
-		switch {
-		case want == 0:
+		if want == 0 {
 			s.dropped++
 			continue
-		case want > discardMaxFill:
-			want = discardMaxFill
-		case uint32(len(s.out))+want > discardMaxQueued:
+		}
+		want = min(want, uint32(discardMaxFill))
+		if uint32(len(s.out))+want > discardMaxQueued {
 			s.dropped++
 			continue
 		}
@@ -199,10 +198,7 @@ func (s *discardSink) Close() error {
 // SetDeadline implements net.Conn. Write deadlines are accepted and ignored:
 // the sink never blocks a write, so there is nothing to time out.
 func (s *discardSink) SetDeadline(t time.Time) error {
-	s.mu.Lock()
-	s.readDeadline = t
-	s.mu.Unlock()
-	return nil
+	return s.SetReadDeadline(t)
 }
 
 // SetReadDeadline implements net.Conn.

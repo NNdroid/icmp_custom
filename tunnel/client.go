@@ -1194,6 +1194,8 @@ func (s *clientSession) pollLoop() {
 		return
 	}
 	cfg := s.client.cfg
+	timer := time.NewTimer(cfg.pollInterval())
+	defer timer.Stop()
 	for {
 		if s.isClosed() {
 			return
@@ -1209,10 +1211,9 @@ func (s *clientSession) pollLoop() {
 		case idleFor >= cfg.idlePoll():
 			interval = cfg.idlePoll()
 		}
-		timer := time.NewTimer(interval)
+		timer.Reset(interval)
 		select {
 		case <-s.closeChan:
-			timer.Stop()
 			return
 		case <-timer.C:
 		}

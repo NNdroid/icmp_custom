@@ -997,6 +997,54 @@ func TestDiscardSinkRefusesToQueueBeyondItsBound(t *testing.T) {
 	}
 }
 
+func TestDiscardSinkClampedFillsRespectQueueBound(t *testing.T) {
+	s := newDiscardSink()
+	defer s.Close()
+	frame := frameLengthRequest(t, discardMaxFill*4)
+	const fills = discardMaxQueued / discardMaxFill
+	for i := 0; i < fills+3; i++ {
+		if _, err := s.Write(frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if st := s.stats(); st.Queued != discardMaxQueued || st.Fills != fills || st.Dropped != 3 {
+		t.Fatalf("clamped requests must obey queue bound: %+v", st)
+	}
+}
+
+func TestDiscardSinkSetDeadlineWakesBlockedRead(t *testing.T) {
+	s := newDiscardSink()
+	defer s.Close()
+	if err := s.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Read(make([]byte, 1))
+		done <- err
+	}()
+	// Wait until Read consumes the initial deadline notification. It has
+	// now observed the old deadline, so the next change must notify it again.
+	limit := time.Now().Add(time.Second)
+	for len(s.wake) != 0 {
+		if time.Now().After(limit) {
+			t.Fatal("Read did not observe the initial deadline")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := s.SetDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("Read = %v, want os.ErrDeadlineExceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SetDeadline did not wake the blocked Read")
+	}
+}
+
 func TestDiscardSinkReadDeadline(t *testing.T) {
 	s := newDiscardSink()
 	defer s.Close()

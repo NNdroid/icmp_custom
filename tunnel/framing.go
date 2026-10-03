@@ -106,23 +106,34 @@ func NewMessageAssembler(maxPayload uint32) *MessageAssembler {
 	return &MessageAssembler{maxPayload: maxPayload}
 }
 
-// Feed appends chunk to the pending stream and returns every message that is
-// now complete (in order). It returns no messages (nil) when the chunk only
-// contains a partial message.
+// Feed returns every complete message in order, buffering only incomplete
+// frames. Returned messages own their storage; chunk may be reused immediately.
+// It returns no messages (nil) when the chunk only contains a partial message.
 func (a *MessageAssembler) Feed(chunk []byte) ([][]byte, error) {
 	if a.broken {
 		return nil, ErrAssemblerBroken
 	}
-	if len(chunk) > 0 {
-		a.buf = append(a.buf, chunk...)
-	}
 
 	var msgs [][]byte
-	for {
-		if len(a.buf) < FrameHeaderSize {
+	for len(chunk) > 0 {
+		buffered := len(a.buf) > 0
+		frame := chunk
+		if buffered {
+			// Finish a split header before interpreting its length.
+			if len(a.buf) < FrameHeaderSize {
+				n := min(FrameHeaderSize-len(a.buf), len(chunk))
+				a.buf = append(a.buf, chunk[:n]...)
+				chunk = chunk[n:]
+			}
+			frame = a.buf
+		}
+		if len(frame) < FrameHeaderSize {
+			if !buffered {
+				a.buf = append(a.buf[:0], chunk...)
+			}
 			break
 		}
-		n := binary.BigEndian.Uint32(a.buf)
+		n := binary.BigEndian.Uint32(frame)
 		if n > a.maxPayload {
 			// A desynced stream cannot be resynchronised: refuse to keep
 			// guessing at frame boundaries.
@@ -130,32 +141,42 @@ func (a *MessageAssembler) Feed(chunk []byte) ([][]byte, error) {
 			a.buf = nil
 			return nil, fmt.Errorf("%w (%d > %d)", ErrMessageTooLarge, n, a.maxPayload)
 		}
-		if len(a.buf) < FrameHeaderSize+int(n) {
+		// Keep the wire length unsigned until it is known to fit in a slice.
+		// A custom uint32 limit may exceed int's range on 32-bit platforms.
+		total := uint64(FrameHeaderSize) + uint64(n)
+		if buffered {
+			need := total - uint64(len(a.buf))
+			take := len(chunk)
+			if uint64(take) > need {
+				take = int(need)
+			}
+			a.buf = append(a.buf, chunk[:take]...)
+			chunk = chunk[take:]
+			frame = a.buf
+		}
+		if uint64(len(frame)) < total {
+			if !buffered {
+				a.buf = append(a.buf[:0], chunk...)
+			}
 			break
 		}
 		if msgs == nil {
 			msgs = make([][]byte, 0, 4)
 		}
 		msg := make([]byte, n)
-		copy(msg, a.buf[FrameHeaderSize:FrameHeaderSize+n])
+		copy(msg, frame[FrameHeaderSize:int(total)])
 		msgs = append(msgs, msg)
-		a.buf = a.buf[FrameHeaderSize+n:]
-	}
-
-	// Reclaim the consumed prefix so a long-lived stream does not keep growing
-	// its backing array.
-	if len(a.buf) == 0 {
-		// Retain modest buffers so a long-lived stream does not allocate again
-		// for every complete frame. Oversized backing arrays are still dropped.
-		if cap(a.buf) > 64*1024 {
-			a.buf = nil
+		if buffered {
+			// Reset from the original base to retain the full capacity, rather
+			// than progressively losing it by slicing off consumed prefixes.
+			if cap(a.buf) > 64*1024 {
+				a.buf = nil
+			} else {
+				a.buf = a.buf[:0]
+			}
 		} else {
-			a.buf = a.buf[:0]
+			chunk = chunk[int(total):]
 		}
-	} else if cap(a.buf) > 64*1024 && len(a.buf)*4 < cap(a.buf) {
-		compact := make([]byte, len(a.buf))
-		copy(compact, a.buf)
-		a.buf = compact
 	}
 	return msgs, nil
 }
