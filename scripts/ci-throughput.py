@@ -97,6 +97,24 @@ def main():
         (baseline / "tunnel/throughput_test.go").write_bytes((root / "tunnel/throughput_test.go").read_bytes())
         for version, directory in (("baseline", baseline), ("candidate", root)):
             run(["go", "test", "-c", "-o", str(binaries[version]), "./tunnel"], cwd=directory)
+        # Profile in separate processes so sampling overhead never contaminates
+        # either member of the throughput comparison. Save these first so a
+        # later failed workload still leaves diagnostic evidence.
+        for direction in ("upload", "download"):
+            profile = output / f"baseline-{direction}.cpu"
+            run([str(binaries["baseline"]), "-test.run=^$",
+                 f"-test.bench=^BenchmarkTunnelBulkTransfer$/{direction}/MSS1400/sessions1$",
+                 "-test.benchtime=2s", "-test.cpu=2", f"-test.cpuprofile={profile}",
+                 f"-test.memprofile={output / (direction + '-allocs.pprof')}"],
+                output=output / f"profile-{direction}.txt")
+            run(["go", "tool", "pprof", "-top", str(binaries["baseline"]), str(profile)],
+                output=output / f"cpu-top-{direction}.txt")
+            run(["go", "tool", "pprof", "-top", "-cum", str(binaries["baseline"]), str(profile)],
+                output=output / f"cpu-cumulative-{direction}.txt")
+            allocation_top = run(["go", "tool", "pprof", "-top", "-alloc_space",
+                                  str(binaries["baseline"]), str(output / f"{direction}-allocs.pprof")],
+                                 output=output / f"alloc-top-{direction}.txt")
+            print(allocation_top, flush=True)
         for round_number in range(args.rounds):
             order = ("baseline", "candidate") if round_number % 2 == 0 else ("candidate", "baseline")
             for version in order:
@@ -106,18 +124,6 @@ def main():
                            output=output / f"{version}-{round_number + 1}.txt")
                 collected[version].append(samples(text))
                 print(f"round {round_number + 1}: {version} delivered and drained all 12 cells", flush=True)
-        # Profile separately, after paired timing, so sampling overhead never
-        # contaminates either member of the throughput comparison.
-        for direction in ("upload", "download"):
-            profile = output / f"baseline-{direction}.cpu"
-            run([str(binaries["baseline"]), "-test.run=^$",
-                 f"-test.bench=^BenchmarkTunnelBulkTransfer$/{direction}/MSS1400/sessions1$",
-                 "-test.benchtime=2s", "-test.cpu=2", f"-test.cpuprofile={profile}"],
-                output=output / f"profile-{direction}.txt")
-            run(["go", "tool", "pprof", "-top", str(binaries["baseline"]), str(profile)],
-                output=output / f"cpu-top-{direction}.txt")
-            run(["go", "tool", "pprof", "-top", "-cum", str(binaries["baseline"]), str(profile)],
-                output=output / f"cpu-cumulative-{direction}.txt")
     cells = []
     regression = False
     for name in sorted(collected["baseline"][0]):
