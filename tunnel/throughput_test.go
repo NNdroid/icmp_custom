@@ -65,6 +65,10 @@ func benchmarkTunnelBulk(b *testing.B, direction string, mss, sessions int) {
 	apps := make([]net.Conn, 0, sessions)
 	targets := make([]net.Conn, 0, sessions)
 	defer func() {
+		// Unblock a full fake-carrier queue before closing sessions, whose FIN
+		// would otherwise wait behind records when a failed sample tears down.
+		_ = cEp.Close()
+		_ = sEp.Close()
 		for _, conn := range apps {
 			_ = conn.Close()
 		}
@@ -81,7 +85,7 @@ func benchmarkTunnelBulk(b *testing.B, direction string, mss, sessions int) {
 		}
 		apps = append(apps, conn)
 		targets = append(targets, <-backends)
-		deadline := time.Now().Add(2 * time.Minute)
+		deadline := time.Now().Add(30 * time.Second)
 		_ = conn.SetDeadline(deadline)
 		_ = targets[i].SetDeadline(deadline)
 	}
@@ -107,6 +111,8 @@ func benchmarkTunnelBulk(b *testing.B, direction string, mss, sessions int) {
 			if err := fn(); err != nil {
 				errors <- err
 				abort.Do(func() {
+					_ = cEp.Close()
+					_ = sEp.Close()
 					for _, conn := range apps {
 						_ = conn.Close()
 					}
