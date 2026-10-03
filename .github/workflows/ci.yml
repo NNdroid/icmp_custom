@@ -1,9 +1,12 @@
 name: CI
 
 on:
+  # Full platform validation is release gating: it runs when a v* tag is
+  # pushed (or manually from the Actions tab). Day-to-day pushes and pull
+  # requests do not trigger it.
   push:
-    branches: [main, master]
-  pull_request:
+    tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read
