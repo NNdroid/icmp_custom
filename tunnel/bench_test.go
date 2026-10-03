@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/netip"
 	"strconv"
 	"testing"
@@ -68,6 +69,47 @@ func BenchmarkMessageAssemblerFeed(b *testing.B) {
 				}
 				if len(msgs) != 1 {
 					b.Fatalf("Feed returned %d messages, want 1", len(msgs))
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkMessageAssemblerChunking(b *testing.B) {
+	for _, mode := range []string{"fragmented", "batch"} {
+		b.Run(mode, func(b *testing.B) {
+			payload := make([]byte, 1200)
+			frame, err := EncodeMessage(payload)
+			if mode == "batch" {
+				frame, err = EncodeMessages(payload, payload, payload, payload)
+			}
+			if err != nil {
+				b.Fatal(err)
+			}
+			asm := NewMessageAssembler(0)
+			bytesPerOp, messagesPerOp := len(payload), 1
+			if mode == "batch" {
+				bytesPerOp, messagesPerOp = 4*len(payload), 4
+			}
+			b.SetBytes(int64(bytesPerOp))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if mode == "fragmented" {
+					for _, part := range [][]byte{frame[:2], frame[2:512]} {
+						msgs, err := asm.Feed(part)
+						if err != nil || len(msgs) != 0 {
+							b.Fatalf("partial frame: msgs=%d err=%v", len(msgs), err)
+						}
+					}
+				}
+				chunk := frame
+				if mode == "fragmented" {
+					chunk = frame[512:]
+				}
+				msgs, err := asm.Feed(chunk)
+				if err != nil || len(msgs) != messagesPerOp || asm.Pending() != 0 {
+					b.Fatalf("complete frame: msgs=%d err=%v pending=%d", len(msgs), err, asm.Pending())
 				}
 			}
 		})
@@ -332,9 +374,90 @@ func BenchmarkPokeBook(b *testing.B) {
 	}
 }
 
+// benchmarkPollEndpoint acknowledges polls synchronously, isolating scheduling
+// and record protection from network latency and the fake link's queue/copies.
+type benchmarkPollEndpoint struct {
+	*fakeEndpoint
+	onPoke func([]byte)
+}
+
+func (e *benchmarkPollEndpoint) Poke(wire []byte, _ netip.AddrPort) (uint16, error) {
+	e.onPoke(wire)
+	return 1, nil
+}
+
+func BenchmarkSessionPollLoop(b *testing.B) {
+	a, peer := newFakeLink("client", "server", 2048)
+	defer a.Close()
+	defer peer.Close()
+	keys, _ := benchFrameKeys(b)
+	ep := &benchmarkPollEndpoint{fakeEndpoint: a}
+	sess := &clientSession{
+		client: &Client{
+			tr: ep, magic: MagicDefault, maxRecordSize: 2048, logger: Nop{},
+			cfg: ClientConfig{
+				PollInterval: time.Nanosecond, IdlePollInterval: time.Hour, KeepAlive: 2 * time.Hour,
+			},
+		},
+		sid: 1, frameKeys: keys, lastActive: time.Now(), closeChan: make(chan struct{}),
+	}
+	count := 0
+	ep.onPoke = func(wire []byte) {
+		var rec Record
+		if err := Parse(wire, MagicDefault, 2048, &rec); err != nil || rec.Cmd != CmdPing {
+			b.Fatalf("poll record: cmd=%d err=%v", rec.Cmd, err)
+		}
+		count++
+		sess.noteAnswered()
+		if count == b.N {
+			close(sess.closeChan)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	sess.pollLoop()
+	b.StopTimer()
+	if count != b.N {
+		b.Fatalf("delivered %d polls, want %d", count, b.N)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Integration: the real receive/send path over the fake carrier
 // ---------------------------------------------------------------------------
+
+// newBenchmarkServer keeps the SYN admission bookkeeping but gives this
+// synthetic single-IP workload enough burst capacity for every iteration and
+// handshake retry. The production limit is deliberately unchanged.
+func newBenchmarkServer(b *testing.B, cfg ServerConfig) *fakeEndpoint {
+	b.Helper()
+	cEp, sEp := newFakeLink("client", "server", testRecordLimit)
+	dial := defaultTargetDialer()
+	srv, err := NewServerWithTransport(cfg, sEp, func(ctx context.Context, sid uint32, network, address string) (net.Conn, error) {
+		conn, err := dial(ctx, sid, network, address)
+		if err != nil {
+			return nil, err
+		}
+		// Every iteration closes a TCP target. Avoid accumulating TIME_WAIT
+		// sockets and exhausting the host's ephemeral ports during calibration.
+		// Echo payloads have already been read and checked before teardown.
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			if err := tcp.SetLinger(0); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+		}
+		return conn, nil
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	// Set this before Start: the read loop accesses the limiter concurrently.
+	srv.synLimiter = newSynLimiter(5, float64(b.N)*8+20)
+	go func() { _ = srv.Start() }()
+	b.Cleanup(srv.Close)
+	return cEp
+}
 
 // BenchmarkFakeLinkRecordRoundTrip measures one write+read through the fake
 // transport with no session layer involved. It is the baseline the integration
@@ -384,11 +507,11 @@ func BenchmarkTunnelEchoRoundTrip(b *testing.B) {
 	backend, stop := tcpEchoServer(b)
 	defer stop()
 
-	cEp, _, _ := newTestServer(b, ServerConfig{
+	cEp := newBenchmarkServer(b, ServerConfig{
 		TargetAddr: "tcp://" + backend,
 		Passwords:  []string{"bench-psk"},
 		Logger:     Nop{},
-	}, nil)
+	})
 	cli := newTestClient(b, ClientConfig{
 		ServerAddr:        "192.0.2.2",
 		Passwords:         []string{"bench-psk"},
@@ -442,11 +565,11 @@ func BenchmarkHandshakeOnly(b *testing.B) {
 	backend, stop := tcpEchoServer(b)
 	defer stop()
 
-	cEp, _, _ := newTestServer(b, ServerConfig{
+	cEp := newBenchmarkServer(b, ServerConfig{
 		TargetAddr: "tcp://" + backend,
 		Passwords:  []string{"bench-psk"},
 		Logger:     Nop{},
-	}, nil)
+	})
 	cli := newTestClient(b, ClientConfig{
 		ServerAddr:        "192.0.2.2",
 		Passwords:         []string{"bench-psk"},

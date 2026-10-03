@@ -126,3 +126,80 @@ func TestFrameAssemblerReclaimsBuffer(t *testing.T) {
 		t.Fatalf("assembler retained a %d-byte backing array", cap(asm.buf))
 	}
 }
+
+func TestFrameAssemblerOwnsMessagesAcrossFeeds(t *testing.T) {
+	for _, split := range []int{0, 1, 4, 7} {
+		t.Run(sizeName(split), func(t *testing.T) {
+			frame, _ := EncodeMessages([]byte("first"), nil, []byte("third"))
+			asm := NewMessageAssembler(0)
+			got, err := asm.Feed(frame[:split])
+			if err != nil {
+				t.Fatal(err)
+			}
+			rest, err := asm.Feed(frame[split:])
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, rest...)
+			clear(frame)
+			next, _ := EncodeMessage([]byte("overwrite any retained buffer"))
+			if _, err := asm.Feed(next); err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 3 || string(got[0]) != "first" || len(got[1]) != 0 || string(got[2]) != "third" {
+				t.Fatalf("messages changed after input reuse or next Feed: %q", got)
+			}
+			if asm.Pending() != 0 {
+				t.Fatalf("Pending = %d, want 0", asm.Pending())
+			}
+		})
+	}
+}
+
+func TestFrameAssemblerWideLengthRemainsPartial(t *testing.T) {
+	// A uint32 header need not fit in int on 32-bit hosts. A header alone is
+	// incomplete, never a complete frame with a wrapped (or negative) size.
+	asm := NewMessageAssembler(^uint32(0))
+	var header [FrameHeaderSize]byte
+	binary.BigEndian.PutUint32(header[:], ^uint32(0))
+	msgs, err := asm.Feed(header[:])
+	if err != nil || len(msgs) != 0 || asm.Pending() != FrameHeaderSize {
+		t.Fatalf("wide partial frame: msgs=%q err=%v pending=%d", msgs, err, asm.Pending())
+	}
+}
+
+func FuzzMessageAssemblerChunking(f *testing.F) {
+	f.Add([]byte("payload"), uint16(3))
+	f.Add([]byte{}, uint16(1))
+	f.Add([]byte("split header and coalesced frames"), uint16(7))
+	f.Fuzz(func(t *testing.T, payload []byte, chunkSize uint16) {
+		if len(payload) > 64<<10 {
+			t.Skip()
+		}
+		want := [][]byte{payload, {}, []byte("tail")}
+		wire, err := EncodeMessages(want...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		asm := NewMessageAssembler(0)
+		var got [][]byte
+		step := 1 + int(chunkSize)
+		for len(wire) > 0 {
+			n := min(step, len(wire))
+			msgs, err := asm.Feed(wire[:n])
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, msgs...)
+			wire = wire[n:]
+		}
+		if len(got) != len(want) || asm.Pending() != 0 {
+			t.Fatalf("got %d messages, pending %d", len(got), asm.Pending())
+		}
+		for i := range want {
+			if !bytes.Equal(got[i], want[i]) {
+				t.Fatalf("message %d differs", i)
+			}
+		}
+	})
+}
