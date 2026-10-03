@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import statistics
 import subprocess
 import tarfile
@@ -14,14 +15,27 @@ import tempfile
 
 
 def run(args, *, cwd=None, output=None):
-    result = subprocess.run(args, cwd=cwd, text=True, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT)
+    process = subprocess.Popen(args, cwd=cwd, text=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT)
+    timed_out = False
+    try:
+        text, _ = process.communicate(timeout=180)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        # Go's testing timeout stops before benchmarks start. Bound the actual
+        # child process and preserve its goroutine dump if a sample stalls.
+        process.send_signal(signal.SIGQUIT)
+        try:
+            text, _ = process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            text, _ = process.communicate()
     if output:
-        output.write_text(result.stdout, encoding="utf-8")
-    if result.returncode:
-        print(result.stdout, flush=True)
-        raise RuntimeError(f"command failed ({result.returncode}): {args}")
-    return result.stdout
+        output.write_text(text, encoding="utf-8")
+    if timed_out or process.returncode:
+        print(text, flush=True)
+        raise RuntimeError(f"command failed ({process.returncode}): {args}")
+    return text
 
 
 def samples(text):
