@@ -1,0 +1,49 @@
+name: Throughput comparison
+
+on:
+  push:
+    branches: [codex/icmp-throughput]
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: Immutable baseline commit SHA
+        default: b9fb2d10794347c3f0505f88a4a2c596163cd57e
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: throughput-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      BASELINE_SHA: ${{ inputs.baseline || 'b9fb2d10794347c3f0505f88a4a2c596163cd57e' }}
+      ICMP_CI_THROUGHPUT: '1'
+      GOMAXPROCS: '2'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+          cache: true
+      - name: Verify correctness and races before measuring
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -race -count=1 ./...
+      - name: Paired throughput and baseline CPU profiles
+        run: python3 scripts/ci-throughput.py --baseline "$BASELINE_SHA" --rounds 5 --benchtime 700ms
+      - name: Upload raw measurements, comparison and profiles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-${{ github.sha }}
+          path: throughput-results/
+          if-no-files-found: warn
