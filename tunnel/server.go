@@ -1251,7 +1251,9 @@ func (sess *ServerSession) verifyInboundRecord(rec *Record, path PathID) bool {
 	if sess.frameKeys == nil {
 		return false
 	}
-	plain, err := OpenRecordAEAD(rec, sess.frameKeys.Recv)
+	// The single receive loop owns this record until dispatch returns; DATA
+	// retained for reordering is copied by handleDataFromPath.
+	plain, err := OpenRecordAEADInto(rec.Data[:0], rec, sess.frameKeys.Recv)
 	if err != nil {
 		if n := sess.server.macFailures.Add(1); n == 1 || n%100 == 0 {
 			sess.server.logWarn("[Session 0x%08X] record authentication rejected cmd=0x%02X from %s: %v",

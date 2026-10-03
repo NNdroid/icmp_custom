@@ -453,7 +453,9 @@ func (c *Client) dispatch(raw []byte, rec *Record) {
 	if sess.frameKeys == nil {
 		return
 	}
-	plain, err := OpenRecordAEAD(rec, sess.frameKeys.Recv)
+	// dispatch finishes before readLoop reuses the carrier buffer. handleData
+	// copies any out-of-order payload that must survive beyond this call.
+	plain, err := OpenRecordAEADInto(rec.Data[:0], rec, sess.frameKeys.Recv)
 	if err != nil {
 		c.logDebug("[Client] [Session 0x%08X] record authentication rejected cmd=0x%02X: %v", sess.sid, rec.Cmd, err)
 		return

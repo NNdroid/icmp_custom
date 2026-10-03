@@ -361,8 +361,9 @@ func OpenRecordAEAD(r *Record, c *NoiseCipherState) ([]byte, error) {
 }
 
 // OpenRecordAEADInto is OpenRecordAEAD with a caller-provided output buffer: the
-// plaintext is appended to dst, so a pooled buffer makes the receive path
-// allocation-free. The result is only valid until dst is recycled.
+// plaintext uses dst's storage from its beginning. Passing r.Data[:0] reuses
+// the ciphertext storage and avoids a payload allocation. The result is only
+// valid until dst is recycled; callers must copy payloads they retain.
 func OpenRecordAEADInto(dst []byte, r *Record, c *NoiseCipherState) ([]byte, error) {
 	if r == nil || c == nil || len(r.raw) < RecordMinSize {
 		return nil, errors.New("noise: invalid record")
