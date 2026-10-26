@@ -520,7 +520,10 @@ func (s *Server) handleHandshake(path PathID, rec *Record, matchedPSK string) {
 		unacked:       make(map[uint64]*unackedPkt),
 		lastActive:    time.Now(),
 		closeChan:     make(chan struct{}),
-		rttEst:        newRTTEstimator(200*time.Millisecond, 200*time.Millisecond, 10*time.Second),
+		// See the client session's note: the lower clamp is rtoFloorNet so a
+		// fast path converges to its real round trip instead of being pinned at
+		// the seed RTO for the life of the session.
+		rttEst: newRTTEstimator(200*time.Millisecond, rtoFloorNet, 10*time.Second),
 	}
 	sess.sendSeq.Store(1)
 	sess.recvSeq.Store(1)
@@ -1745,12 +1748,14 @@ func (sess *ServerSession) retransmitLoop() {
 			return
 		case <-ticker.C:
 			now := time.Now()
-			// The carrier may declare a floor far above the estimator's RTO —
-			// a throttled path cannot answer faster than its own pace, and a
+			// The carrier may declare a floor above the estimator's RTO — a
+			// throttled path cannot answer faster than its own pace, and a
 			// blocked one must not be probed faster than its block timeout, or
 			// every retransmit is more fuel on a fire that is already being
-			// rate-limited. Re-read it each tick because it moves with the
-			// carrier's classification.
+			// rate-limited. A responsive path tracks the observed RTT, and a
+			// carrier that declares no floor returns zero and lets the estimator
+			// govern. Re-read it each tick because it moves with the carrier's
+			// classification.
 			floor := rtoFloorOf(sess.server.tr)
 			fed := sess.server.mtuFed
 			// Collect the records due for retransmission under the lock, then

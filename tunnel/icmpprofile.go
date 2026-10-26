@@ -491,6 +491,11 @@ const (
 	// carrierRTTBalloon is the multiple of the best observed RTT that counts
 	// as "the path has degraded" even when replies still arrive.
 	carrierRTTBalloon = 3
+	// carrierRTTFloorFactor is the multiple of the observed RTT used as the
+	// retransmit floor on a responsive path. It sits close to the RFC 6298 RTO
+	// of SRTT + 4xRTTVAR at low variance: long enough to absorb reordering and
+	// queueing, short enough that one loss does not cost dozens of round trips.
+	carrierRTTFloorFactor = 4
 )
 
 type carrierBucket struct {
@@ -627,6 +632,14 @@ func (m *carrierMonitor) State() CarrierState {
 }
 
 // RTOFloor is the smallest retransmit timeout worth using right now.
+//
+// Throttled and blocked keep fixed, deliberately slow floors: on those paths the
+// floor's job is to stop retransmitting faster than the path can answer. On a
+// responsive path the floor instead tracks the observed RTT, because there its
+// job is only to keep the timeout above one round trip. The previous fixed
+// floor made a 4ms path wait 200ms for its first retransmit - fifty round trips
+// - even though every later record in the window had already been acknowledged
+// and the loss was provably the only thing outstanding.
 func (m *carrierMonitor) RTOFloor() time.Duration {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -640,6 +653,20 @@ func (m *carrierMonitor) RTOFloor() time.Duration {
 		// back (the session's retry ceiling is reached at that cadence).
 		return m.blockTimeout
 	default:
+		if m.rttEWMA <= 0 {
+			// No round trips observed yet, so there is nothing to track and the
+			// seed floor applies.
+			return m.baseFloor
+		}
+		f := carrierRTTFloorFactor * m.rttEWMA
+		if f < rtoFloorNet {
+			// A near-zero RTT must not collapse the timeout to zero, which would
+			// turn the retransmit loop into a tight spin.
+			f = rtoFloorNet
+		}
+		if f < m.baseFloor {
+			return f
+		}
 		return m.baseFloor
 	}
 }

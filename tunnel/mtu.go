@@ -79,13 +79,18 @@ const (
 	// sends: a record that was retransmitted proves the path is marginal, not
 	// that it is roomy.
 	mtuAcksToGrow = 8
-	// mtuLossesToShrink is how many consecutive failures at the current budget
-	// are tolerated before stepping down. A single loss is noise.
+	// mtuLossesToShrink is how many consecutive FULL-BUDGET failures are
+	// tolerated before stepping down. A single loss is noise, and a small
+	// record failing says the path is lossy rather than narrow, so it does not
+	// count at all (see recordLost).
 	mtuLossesToShrink = 3
-	// mtuFrozenRetry is how long a shrunken budget is trusted before the
-	// search is allowed to try growing again. Without it a transient black
-	// spot would shrink a path permanently.
-	mtuFrozenRetry = 10 * time.Minute
+	// mtuFrozenRetry is how long a shrunken budget is trusted before the search
+	// is allowed to try growing again. It exists to stop a marginal path
+	// oscillating between shrink and grow, and it must therefore be longer than
+	// the time it takes to accumulate mtuAcksToGrow. Sixty seconds is well
+	// beyond that on any busy path, while a false shrink recovers in a minute
+	// instead of ten minutes.
+	mtuFrozenRetry = 60 * time.Second
 )
 
 // mtuController owns the live send budget: the complete-record size the session
@@ -212,14 +217,30 @@ func (m *mtuController) recordAcked(size int) {
 // recordLost feeds one record that failed to get through: a retransmission
 // timeout, or one that exhausted its retries.
 //
-// Only a full-budget record is evidence about the ceiling. A small record
-// failing says the path is lossy, not that it is narrow, so it steps down from
-// the current budget rather than from the size that was lost — shrinking from
-// a small record would trade a lossy path for a deliberately tiny one.
+// Only a loss AT OR ABOVE THE CURRENT BUDGET is evidence about the ceiling,
+// mirroring recordAcked's gate. A small record failing says the path is lossy,
+// not narrow, so it is ignored rather than fed - otherwise a merely lossy path
+// would shrink a wide budget toward the floor and pin it there.
+//
+// The step is always taken from the CURRENT budget, never from the size of the
+// record that was lost. Stepping from the lost size lets a record sent under a
+// larger, since-shrunk budget grow the budget as a side effect of its own
+// failure, which is the exact opposite of what this signal means.
+//
+// The carrier's classifier suspends the controller while the path is throttled
+// or blocked, so a rate-limited path cannot be mistaken for a narrow one. A
+// lossy-but-responsive path IS classified healthy, which is why the size gate
+// above carries this one: loss and narrowness have to be told apart, and the
+// only evidence that distinguishes them is whether the record that failed was
+// full size.
 func (m *mtuController) recordLost(size int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.mode == mtuFixed || m.suspended {
+		return
+	}
+	if size < m.cur {
+		// Below the current budget: this is evidence about loss, not width.
 		return
 	}
 	m.losses++
@@ -229,11 +250,7 @@ func (m *mtuController) recordLost(size int) {
 	}
 	m.losses = 0
 
-	from := size
-	if from < m.cur {
-		from = m.cur
-	}
-	next := from - m.step
+	next := m.cur - m.step
 	if next < m.floor {
 		next = m.floor
 	}

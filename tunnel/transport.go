@@ -262,21 +262,38 @@ func carrierConditionOf(tr Transport) CarrierCondition {
 	return nil
 }
 
-// defaultRTOFloor is the retransmit floor used when a carrier declares none.
-// It matches the historical RTO estimator seed, so carriers that don't opt in
-// behave exactly as before.
+// defaultRTOFloor is the retransmit floor a carrier uses until it has observed
+// an RTT. It matches the historical RTO estimator seed.
 const defaultRTOFloor = 200 * time.Millisecond
 
-// rtoFloorOf reports the carrier's current retransmit floor, falling back to
-// defaultRTOFloor. Callers on a hot path should cache the CarrierCondition
-// instead of re-asserting per packet.
+// rtoFloorNet is the smallest retransmit timeout an RTT-aware floor may return
+// to. It exists only so a path whose RTT converges near zero cannot collapse the
+// timeout to zero and turn the retransmit loop into a tight spin; it is not a
+// policy floor. A 4ms RTT path gets about 16ms, so this only bites on loops
+// faster than a real network.
+const rtoFloorNet = 10 * time.Millisecond
+
+// rtoFloorOf reports the carrier's current retransmit floor, or zero when the
+// carrier declares no floor and therefore has no opinion about retransmit
+// cadence. A zero floor means the estimator's own RTO governs; the retransmit
+// loops apply it as `max(pkt.rto, floor)`, so zero is a no-op clamp.
+//
+// Historically this fell back to defaultRTOFloor, which put a 200ms floor on
+// every carrier that did not opt in. That was correct as a safety net and wrong
+// as a policy: on a 4ms-RTT path 200ms is 50x the round trip, so a lost record
+// waited fifty round trips before its first retransmit even though every later
+// record in the window had already been acknowledged. Carriers that DO declare a
+// floor keep exactly the previous behaviour.
+//
+// Callers on a hot path should cache the CarrierCondition instead of
+// re-asserting per packet.
 func rtoFloorOf(tr Transport) time.Duration {
 	if c := carrierConditionOf(tr); c != nil {
 		if floor := c.RTOFloor(); floor > 0 {
 			return floor
 		}
 	}
-	return defaultRTOFloor
+	return 0
 }
 
 // payloadBudgetOf reports the largest plaintext payload the carrier can carry

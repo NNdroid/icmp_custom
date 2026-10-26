@@ -77,6 +77,34 @@ func TestRTTEstimatorInitialRTOIsExposed(t *testing.T) {
 	}
 }
 
+// TestRTTEstimatorConvergesBelowTheSeedRTO covers the clamp the sessions now
+// pass. Clamping at the seed RTO pinned a 4ms-RTT path at 200ms for the life
+// of the session, which made one loss cost fifty round trips. The lower clamp
+// is rtoFloorNet, so a fast path must be free to converge near its real
+// round trip while still never returning a zero or negative timeout.
+func TestRTTEstimatorConvergesBelowTheSeedRTO(t *testing.T) {
+	e := newRTTEstimator(200*time.Millisecond, rtoFloorNet, 10*time.Second)
+	if e.RTO() != 200*time.Millisecond {
+		t.Fatalf("before any sample RTO = %v, want the seed 200ms", e.RTO())
+	}
+	for i := 0; i < 100; i++ {
+		e.Sample(4 * time.Millisecond)
+	}
+	rto := e.RTO()
+	if rto >= 200*time.Millisecond {
+		t.Fatalf("after 100 samples of 4ms RTO = %v, still at or above the seed", rto)
+	}
+	if rto < rtoFloorNet {
+		t.Fatalf("RTO = %v, below the safety net %v", rto, rtoFloorNet)
+	}
+	// ~4ms RTT at low variance gives SRTT + 4xRTTVAR of about 8ms. Anything
+	// within a factor of ten of that is converged; anything near the seed is
+	// not.
+	if rto > 80*time.Millisecond {
+		t.Fatalf("RTO = %v, the estimator did not converge toward the 4ms RTT", rto)
+	}
+}
+
 // TestRTTEstimatorConcurrentUse is a race-detector exercise: Sample, RTO and
 // SRTT must be safe to call from different goroutines.
 func TestRTTEstimatorConcurrentUse(t *testing.T) {

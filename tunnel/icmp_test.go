@@ -543,6 +543,54 @@ func TestCarrierMonitorFewRepliesThrottle(t *testing.T) {
 	}
 }
 
+// TestCarrierMonitorRTOFloorTracksObservedRTT is the whole point of the
+// responsive-path floor: on a path that answers promptly, waiting a fixed
+// 200ms to retransmit costs fifty round trips for a 4ms path. Throttled and
+// blocked must keep their fixed, deliberately slow floors unchanged, because
+// there the floor's job is to stop adding traffic to a path that is already
+// refusing to answer.
+func TestCarrierMonitorRTOFloorTracksObservedRTT(t *testing.T) {
+	mon, _ := newTestMonitor(Nop{})
+
+	if got := mon.RTOFloor(); got != mon.baseFloor {
+		t.Fatalf("no samples: RTO floor = %v, want the base floor %v", got, mon.baseFloor)
+	}
+
+	mon.noteReply(4 * time.Millisecond)
+	want := carrierRTTFloorFactor * 4 * time.Millisecond
+	if got := mon.RTOFloor(); got != want {
+		t.Fatalf("4ms RTT: RTO floor = %v, want %v", got, want)
+	}
+	if got := mon.RTOFloor(); got >= mon.baseFloor {
+		t.Fatalf("4ms RTT: RTO floor %v still at or above the base floor %v", got, mon.baseFloor)
+	}
+
+	// An RTT so large that the factor exceeds the base floor must not raise it
+	// above the base floor: the base floor is the policy ceiling.
+	mon.noteReply(60 * time.Second)
+	if got := mon.RTOFloor(); got != mon.baseFloor {
+		t.Fatalf("slow path: RTO floor = %v, want the base floor %v", got, mon.baseFloor)
+	}
+
+	// The net stops a zero RTT collapsing the floor to zero, which would turn
+	// the retransmit loop into a tight spin.
+	mon.noteReply(0)
+	if got := mon.RTOFloor(); got < rtoFloorNet {
+		t.Fatalf("zero RTT: RTO floor = %v, below the safety net %v", got, rtoFloorNet)
+	}
+}
+
+// TestRTOFloorOfIsZeroWhenTheCarrierDeclaresNone pins the fallback: a carrier
+// with no opinion about retransmit cadence must not impose one, so the
+// estimator's own RTO governs. The previous fallback forced defaultRTOFloor on
+// every such carrier.
+func TestRTOFloorOfIsZeroWhenTheCarrierDeclaresNone(t *testing.T) {
+	ep, _ := newFakeLink("client", "server", testRecordLimit)
+	if got := rtoFloorOf(ep); got != 0 {
+		t.Fatalf("rtoFloorOf(undeclared carrier) = %v, want 0", got)
+	}
+}
+
 func TestCarrierMonitorAuthenticatedRecordClearsBlock(t *testing.T) {
 	mon, _ := newTestMonitor(Nop{})
 	for i := 0; i < carrierMinPolls; i++ {
@@ -747,6 +795,58 @@ func TestMTUControllerShrinksAfterRepeatedLoss(t *testing.T) {
 	c.recordLost(c.budget())
 	if got := c.budget(); got != 1100 {
 		t.Fatalf("budget after %d losses = %d, want 1100", mtuLossesToShrink, got)
+	}
+}
+
+// TestMTUControllerIgnoresSubBudgetLosses guards the loss/width distinction. A
+// path can be lossy without being narrow, and treating every loss as MTU
+// evidence is how a 5% lossy path gets pinned at the floor budget: the losses
+// are about the path, not about the record size, so they must not move the
+// budget at all.
+func TestMTUControllerIgnoresSubBudgetLosses(t *testing.T) {
+	c := newMTUController(mtuInBand, 1472, 548, 100)
+	// A control-sized record is nowhere near the current budget.
+	small := c.budget() - 1000
+	for i := 0; i < 100*mtuLossesToShrink; i++ {
+		c.recordLost(small)
+	}
+	if got := c.budget(); got != icmpSafeStartPayload {
+		t.Fatalf("sub-budget losses shrank the budget to %d", got)
+	}
+	// Nor do they count towards a later full-budget loss run.
+	for i := 0; i < mtuLossesToShrink; i++ {
+		c.recordLost(c.budget() - 1000)
+	}
+	if c.losses != 0 {
+		t.Fatalf("sub-budget losses counted %d towards the shrink threshold", c.losses)
+	}
+	c.recordLost(c.budget())
+	if got := c.budget(); got != icmpSafeStartPayload {
+		t.Fatalf("one full-budget loss shrank the budget to %d", got)
+	}
+}
+
+// TestMTUControllerNeverGrowsFromALoss guards against a loss moving the budget
+// UP. It was reachable: a record sent under a larger budget that later fails
+// carried a size above the current one, and stepping down from that size
+// restored part of the budget that a previous loss had removed.
+func TestMTUControllerNeverGrowsFromALoss(t *testing.T) {
+	c := newMTUController(mtuInBand, 1472, 548, 100)
+	for i := 0; i < mtuLossesToShrink; i++ {
+		c.recordLost(c.budget())
+	}
+	shrunk := c.budget()
+	if shrunk == icmpSafeStartPayload {
+		t.Fatalf("setup failed: budget never shrunk")
+	}
+	// A record emitted while the budget was still 1200, arriving as a loss
+	// after it shrank to 1100. The size is evidence that 1200 was too big, not
+	// that 1200 is worth having back.
+	for i := 0; i < 5*mtuLossesToShrink; i++ {
+		c.recordLost(icmpSafeStartPayload)
+		if got := c.budget(); got > shrunk {
+			t.Fatalf("a loss grew the budget from %d to %d", shrunk, got)
+		}
 	}
 }
 

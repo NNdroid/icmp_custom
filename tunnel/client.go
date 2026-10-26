@@ -585,7 +585,11 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 		lastActive: time.Now(),
 		lastSent:   time.Now(),
 		closeChan:  make(chan struct{}),
-		rttEst:     newRTTEstimator(200*time.Millisecond, 200*time.Millisecond, 10*time.Second),
+		// The seed RTO (before any sample) and the maximum are policy; the lower
+		// clamp is deliberately rtoFloorNet, not the seed, so a fast path is
+		// allowed to converge to an RTO near its real round trip. Clamping at
+		// the seed would pin a 4ms path at 200ms for the life of the session.
+		rttEst: newRTTEstimator(200*time.Millisecond, rtoFloorNet, 10*time.Second),
 	}
 	sess.sendSeq.Store(1)
 	sess.recvSeq.Store(1)
@@ -1101,11 +1105,14 @@ func (s *clientSession) retransmitLoop() {
 			return
 		case <-ticker.C:
 			now := time.Now()
-			// The carrier may declare a floor well above the estimator's RTO: a
+			// The carrier may declare a floor above the estimator's RTO: a
 			// throttled path cannot answer faster than its own pace, and a
 			// blocked one must not be probed faster than its block timeout, or
 			// every retransmit is more fuel on the fire that is rate-limiting
-			// us. Re-read each tick because it moves with the classification.
+			// us. On a responsive path the floor tracks the observed RTT and a
+			// carrier that declares no floor at all returns zero, leaving the
+			// estimator's own RTO to govern. Re-read each tick because it moves
+			// with the classification.
 			floor := rtoFloorOf(s.client.tr)
 			fed := s.client.mtuFed
 			// Collect the records due for retransmission under the lock, then
