@@ -86,8 +86,59 @@ jobs:
           cache: true
       # -benchtime 1x: run every benchmark once just to prove it executes and
       # does not panic or hang. Real numbers come from the nightly/bench job.
+      #
+      # Only ungated benchmarks land here. BenchmarkTunnelBulkTransfer skips
+      # itself unless ICMP_CI_THROUGHPUT is set, so it never executes in this
+      # step; the throughput comparison workflow is the only place it runs.
+      # BenchmarkTunnelWeaknet is deliberately ungated, so it does land here and
+      # is the weak-network smoke test: a benchmark that never runs in this job
+      # cannot fail it.
       - name: Run benchmarks (single iteration each)
         run: go test -run '^$' -bench . -benchtime 1x ./...
+
+  bench-weaknet:
+    name: Benchmark weak-network conditions
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Match the throughput comparison workflow: a faster runner must not be
+      # able to hide a stall by adding cores.
+      GOMAXPROCS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+      # Established encrypted/ARQ sessions over the seeded weak-network
+      # simulator: one-way delay, jitter (which is what reorders records),
+      # independent per-record loss and corruption.
+      #
+      # The assertion is the point: each cell fails the job unless it delivers
+      # 100% of the payload with zero carrier drops and a fully drained ARQ and
+      # reorder state. Those are exactly what loss, latency and reordering
+      # threaten, and they hold or they do not regardless of how fast the
+      # runner is, so this job is the CI gate for them. The timings are a trend
+      # signal only: profiles are seeded, but which records actually get dropped
+      # depends on how the two direction schedulers interleave.
+      #
+      # -benchtime 1x fixes the workload size per cell instead of letting Go
+      # size it to the runner, and -count=3 repeats it three times to catch a
+      # hang or a goroutine leak that only shows up on a later run.
+      - name: Run the weak-network benchmark
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -run '^$' -bench '^BenchmarkTunnelWeaknet$' -benchtime 1x \
+            -count=3 -timeout 12m ./tunnel/ 2>&1 | tee bench-weaknet.txt
+      - name: Upload benchmark output (always, for post-mortem)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-weaknet-${{ github.sha }}
+          path: bench-weaknet.txt
+          if-no-files-found: ignore
 
   cross-build:
     name: Cross build (${{ matrix.goos }}/${{ matrix.goarch }})
