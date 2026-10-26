@@ -191,8 +191,8 @@ func TestICMPProfileDefaults(t *testing.T) {
 	if got.maxPayload != icmpDefaultMaxPayload {
 		t.Fatalf("max_payload = %d, want %d", got.maxPayload, icmpDefaultMaxPayload)
 	}
-	if got.mtuMode != mtuProbe {
-		t.Fatalf("mtu_mode = %v, want probe", got.mtuMode)
+	if got.mtuMode != mtuInBand {
+		t.Fatalf("mtu_mode = %v, want auto", got.mtuMode)
 	}
 	if got.mtuMin != icmpDefaultMTUMin || got.mtuStep != icmpDefaultMTUStep {
 		t.Fatalf("mtu_min/step = %d/%d, want %d/%d",
@@ -676,8 +676,8 @@ func TestMTUControllerFixedModeNeverMoves(t *testing.T) {
 func TestMTUControllerStartsAtTheConservativeDefault(t *testing.T) {
 	// 1200 is below the IPv6 guaranteed floor, so the default never fragments.
 	c := newMTUController(mtuInBand, 1472, 548, 100)
-	if got := c.budget(); got != icmpDefaultMaxPayload {
-		t.Fatalf("adaptive start = %d, want %d", got, icmpDefaultMaxPayload)
+	if got := c.budget(); got != icmpSafeStartPayload {
+		t.Fatalf("adaptive start = %d, want %d", got, icmpSafeStartPayload)
 	}
 }
 
@@ -688,13 +688,13 @@ func TestMTUControllerGrowsAfterConsecutiveFullBudgetAcks(t *testing.T) {
 		// ceiling and must reset the run.
 		c.recordAcked(c.budget() - 1)
 	}
-	if got := c.budget(); got != icmpDefaultMaxPayload {
+	if got := c.budget(); got != icmpSafeStartPayload {
 		t.Fatalf("a sub-budget ack grew the budget to %d", got)
 	}
 	for i := 0; i < mtuAcksToGrow; i++ {
 		c.recordAcked(c.budget())
 	}
-	if got := c.budget(); got != icmpDefaultMaxPayload+100 {
+	if got := c.budget(); got != icmpSafeStartPayload+100 {
 		t.Fatalf("budget after %d full-budget acks = %d, want 1300", mtuAcksToGrow, got)
 	}
 }
@@ -781,28 +781,6 @@ func TestMTUControllerAdoptsPathBudgetDownOnly(t *testing.T) {
 	}
 }
 
-func TestMTUControllerAdoptProbedOnlyInProbeMode(t *testing.T) {
-	inBand := newMTUController(mtuInBand, 1472, 548, 100)
-	inBand.adoptProbed(1400)
-	if got := inBand.budget(); got != icmpDefaultMaxPayload {
-		t.Fatalf("a probe result must be ignored outside probe mode; got %d", got)
-	}
-
-	probe := newMTUController(mtuProbe, 1472, 548, 100)
-	probe.adoptProbed(1400)
-	if got := probe.budget(); got != 1400 {
-		t.Fatalf("probe budget = %d, want 1400", got)
-	}
-	probe.adoptProbed(99999)
-	if got := probe.budget(); got != 1472 {
-		t.Fatalf("probe budget = %d, want the ceiling 1472", got)
-	}
-	probe.adoptProbed(1)
-	if got := probe.budget(); got != 548 {
-		t.Fatalf("probe budget = %d, want the floor 548", got)
-	}
-}
-
 func TestMTUControllerShrinkForOversizeIsImmediate(t *testing.T) {
 	c := newMTUController(mtuInBand, 1472, 548, 100)
 	// The kernel refused exactly this size, which is as precise as a
@@ -823,14 +801,14 @@ func TestMTUControllerSuspendsWhileCarrierIsUnhealthy(t *testing.T) {
 		c.recordLost(c.budget())
 	}
 	c.shrinkForOversize(c.budget())
-	if got := c.budget(); got != icmpDefaultMaxPayload {
+	if got := c.budget(); got != icmpSafeStartPayload {
 		t.Fatalf("a suspended controller moved to %d", got)
 	}
 	c.setSuspended(false)
 	for i := 0; i < mtuAcksToGrow; i++ {
 		c.recordAcked(c.budget())
 	}
-	if got := c.budget(); got != icmpDefaultMaxPayload+100 {
+	if got := c.budget(); got != icmpSafeStartPayload+100 {
 		t.Fatalf("budget after resuming = %d, want 1300", got)
 	}
 }
@@ -1123,8 +1101,8 @@ func TestICMPTransportPublishesLiveBudgetAndFixedReceiveCeiling(t *testing.T) {
 		MaxPayload: 1452, MTUMode: "auto", PaceMS: 1,
 	}, Nop{})
 
-	if got := tr.MaxRecordSize(); got != icmpDefaultMaxPayload {
-		t.Fatalf("initial send budget = %d, want %d", got, icmpDefaultMaxPayload)
+	if got := tr.MaxRecordSize(); got != icmpSafeStartPayload {
+		t.Fatalf("initial send budget = %d, want %d", got, icmpSafeStartPayload)
 	}
 	if got := tr.MaxReceiveSize(); got != 1452 {
 		t.Fatalf("receive ceiling = %d, want the configured 1452", got)
@@ -1132,7 +1110,7 @@ func TestICMPTransportPublishesLiveBudgetAndFixedReceiveCeiling(t *testing.T) {
 	for i := 0; i < mtuAcksToGrow; i++ {
 		tr.RecordAcked(tr.MaxRecordSize())
 	}
-	if got := tr.MaxRecordSize(); got != icmpDefaultMaxPayload+100 {
+	if got := tr.MaxRecordSize(); got != icmpSafeStartPayload+100 {
 		t.Fatalf("send budget after acks = %d, want 1300", got)
 	}
 	if got := tr.MaxReceiveSize(); got != 1452 {
@@ -1269,15 +1247,15 @@ func TestICMPTransportForwardsBothMTUFeedbackDirections(t *testing.T) {
 	for i := 0; i < mtuAcksToGrow; i++ {
 		tr.RecordAcked(tr.MaxRecordSize())
 	}
-	if got := tr.MaxRecordSize(); got != icmpDefaultMaxPayload+100 {
+	if got := tr.MaxRecordSize(); got != icmpSafeStartPayload+100 {
 		t.Fatalf("send budget after acks = %d, want 1300", got)
 	}
 	// ...and step back down on repeated loss.
 	for i := 0; i < mtuLossesToShrink; i++ {
 		tr.RecordLost(tr.MaxRecordSize())
 	}
-	if got := tr.MaxRecordSize(); got != icmpDefaultMaxPayload {
-		t.Fatalf("send budget after losses = %d, want a step back to %d", got, icmpDefaultMaxPayload)
+	if got := tr.MaxRecordSize(); got != icmpSafeStartPayload {
+		t.Fatalf("send budget after losses = %d, want a step back to %d", got, icmpSafeStartPayload)
 	}
 }
 
@@ -1501,7 +1479,7 @@ func TestICMPTransportCapabilitySurface(t *testing.T) {
 	}, Nop{})
 
 	var asTransport Transport = tr
-	if maxRecordSizeOf(asTransport) != icmpDefaultMaxPayload {
+	if maxRecordSizeOf(asTransport) != 1200 {
 		t.Fatalf("MaxRecordSizer = %d", maxRecordSizeOf(asTransport))
 	}
 	if maxReceiveSizeOf(asTransport) != 1200 {
@@ -1522,7 +1500,7 @@ func TestICMPTransportCapabilitySurface(t *testing.T) {
 	if authenticatedFeedbackOf(asTransport) == nil {
 		t.Fatal("the ICMP carrier must expose AuthenticatedFeedback")
 	}
-	if got := payloadBudgetOf(asTransport, 0); got != MaxPayloadFor(icmpDefaultMaxPayload) {
-		t.Fatalf("payloadBudgetOf = %d, want %d", got, MaxPayloadFor(icmpDefaultMaxPayload))
+	if got := payloadBudgetOf(asTransport, 0); got != MaxPayloadFor(1200) {
+		t.Fatalf("payloadBudgetOf = %d, want %d", got, MaxPayloadFor(1200))
 	}
 }

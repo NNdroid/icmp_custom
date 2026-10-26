@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -21,19 +20,17 @@ import (
 // the probe IS a real data record, and the verdict IS its acknowledgement. No
 // new wire format, and nothing that looks unlike ordinary traffic.
 //
-// There are two cooperating mechanisms:
+// In-band adaptation runs for the life of a session. It grows the budget after
+// a run of acknowledged full-budget records, and shrinks it after repeated
+// losses — but a frag-needed message, when one does arrive, is applied
+// immediately because it is the only precise signal in the whole system.
 //
-//   - In-band adaptation (method B) runs for the life of a session. It grows
-//     the budget after a run of acknowledged full-budget records, and shrinks
-//     it after repeated losses — but a frag-needed message, when one does
-//     arrive, is applied immediately because it is the only precise signal in
-//     the whole system.
-//   - The active probe (method A′) runs once, at session setup, over a
-//     dedicated session to the built-in `discard://` sink (discard.go). It
-//     binary-searches both directions with real records and then gets out of
-//     the way. If it cannot run — the sink is not allowed, the peer is an older
-//     build, the carrier is already throttled — it fails quietly and method B
-//     carries on, which is strictly better than not having a budget at all.
+// There was also an active probe (method A′): a one-shot binary search over a
+// dedicated session to the built-in `discard://` sink. It never got wired to a
+// caller, so it is gone; the search was pure but driving it needs a send path
+// that bypasses the session's own record chunking, which does not exist. In-band
+// adaptation alone is not slower in practice — it converges on the first
+// sustained upload, which is exactly when a bigger budget is wanted.
 //
 // Per-direction is fundamental: a path MTU is asymmetric in practice, and the
 // budget belongs to the SENDER. Each end therefore searches its own outbound
@@ -46,11 +43,9 @@ const (
 	// mtuFixed trusts the configured budget and never adapts. It is the escape
 	// hatch for a path whose behaviour the operator already knows.
 	mtuFixed mtuMode = iota
-	// mtuInBand runs in-band adaptation (method B) only.
+	// mtuInBand runs in-band adaptation only. It is the default, and the only
+	// mode that adapts.
 	mtuInBand
-	// mtuProbe runs the active probe (method A′) and then keeps adapting
-	// in-band. It is the default.
-	mtuProbe
 )
 
 func (m mtuMode) String() string {
@@ -59,22 +54,23 @@ func (m mtuMode) String() string {
 		return "fixed"
 	case mtuInBand:
 		return "auto"
-	case mtuProbe:
-		return "probe"
 	}
 	return "unknown"
 }
 
 func parseMTUMode(s string) (mtuMode, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "", "probe":
-		return mtuProbe, nil
-	case "auto", "in-band", "inband":
+	case "", "auto", "in-band", "inband":
+		return mtuInBand, nil
+	// "probe" is a deprecated alias. The active probe it named was never wired
+	// to a caller, so it always behaved exactly like "auto"; accepting it keeps
+	// configs written for older releases valid instead of failing at startup.
+	case "probe":
 		return mtuInBand, nil
 	case "fixed", "off", "none":
 		return mtuFixed, nil
 	}
-	return mtuProbe, fmt.Errorf("%w: icmp.mtu_mode = %q (want probe, auto or fixed)", ErrConfigRequired, s)
+	return mtuInBand, fmt.Errorf("%w: icmp.mtu_mode = %q (want auto or fixed)", ErrConfigRequired, s)
 }
 
 const (
@@ -90,9 +86,6 @@ const (
 	// search is allowed to try growing again. Without it a transient black
 	// spot would shrink a path permanently.
 	mtuFrozenRetry = 10 * time.Minute
-	// mtuProbeBudget is the total number of probe records the active search
-	// may spend, split evenly between the two directions.
-	mtuProbeBudget = 12
 )
 
 // mtuController owns the live send budget: the complete-record size the session
@@ -129,11 +122,11 @@ func newMTUController(mode mtuMode, ceiling, floor, step int) *mtuController {
 
 	start := ceiling
 	if mode != mtuFixed {
-		// Start at min(max_payload, 1200): the documented default never
-		// fragments on either family, so the worst case is no better and no
-		// worse than not adapting at all.
-		if start > icmpDefaultMaxPayload {
-			start = icmpDefaultMaxPayload
+		// Start at min(max_payload, icmpSafeStartPayload): that value never
+		// fragments on either family, so the worst case is no worse than not
+		// adapting at all. Anything above it is reached only with evidence.
+		if start > icmpSafeStartPayload {
+			start = icmpSafeStartPayload
 		}
 		if start < floor {
 			start = floor
@@ -216,8 +209,14 @@ func (m *mtuController) recordAcked(size int) {
 	}
 }
 
-// recordLost feeds one record that exhausted its retransmissions.
-func (m *mtuController) recordLost(int) {
+// recordLost feeds one record that failed to get through: a retransmission
+// timeout, or one that exhausted its retries.
+//
+// Only a full-budget record is evidence about the ceiling. A small record
+// failing says the path is lossy, not that it is narrow, so it steps down from
+// the current budget rather than from the size that was lost — shrinking from
+// a small record would trade a lossy path for a deliberately tiny one.
+func (m *mtuController) recordLost(size int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.mode == mtuFixed || m.suspended {
@@ -230,7 +229,11 @@ func (m *mtuController) recordLost(int) {
 	}
 	m.losses = 0
 
-	next := m.cur - m.step
+	from := size
+	if from < m.cur {
+		from = m.cur
+	}
+	next := from - m.step
 	if next < m.floor {
 		next = m.floor
 	}
@@ -269,30 +272,6 @@ func (m *mtuController) adoptPathBudget(recordBudget int) {
 	m.acks = 0
 	m.losses = 0
 	m.freezeLocked()
-}
-
-// adoptProbed applies an active-probe result. A probe is stronger evidence than
-// in-band guessing, so it sets the budget outright — still clamped to
-// [floor, ceiling], and still never above the configured maximum.
-func (m *mtuController) adoptProbed(recordBudget int) {
-	if recordBudget <= 0 {
-		return
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.mode != mtuProbe {
-		return
-	}
-	if recordBudget < m.floor {
-		recordBudget = m.floor
-	}
-	if recordBudget > m.ceiling {
-		recordBudget = m.ceiling
-	}
-	m.cur = recordBudget
-	m.acks = 0
-	m.losses = 0
-	m.frozen = false
 }
 
 // shrinkForOversize applies "the kernel refused this exact size". With
@@ -348,220 +327,4 @@ func (m *mtuController) freezeLocked() {
 		m.frozen = true
 		m.frozenAt = time.Now()
 	}
-}
-
-// ---------------------------------------------------------------------------
-// Method A': the active probe
-// ---------------------------------------------------------------------------
-
-// mtuProbeLink is the narrow view of a dedicated probe session that the active
-// search needs.
-//
-// It is expressed in RECORD terms on purpose. A probe built on a byte stream
-// cannot answer the only question that matters — "did one record of exactly N
-// bytes make it?" — because the session is free to split a write into smaller
-// records. Sizes below are plaintext payload bytes, so the link owns the
-// header and tag arithmetic.
-type mtuProbeLink interface {
-	// ProbeUplink ships exactly one record carrying payloadBytes of plaintext
-	// and reports whether the peer acknowledged it.
-	ProbeUplink(ctx context.Context, payloadBytes int) (bool, error)
-	// ProbeDownlink asks the peer for payloadBytes of downlink filler and
-	// reports whether a SINGLE record of at least that payload arrived.
-	//
-	// This measures the peer's send budget rather than the raw path, because
-	// the peer cannot emit a record larger than its own budget. That is exactly
-	// the number this end needs: it is the ceiling on downlink record size, and
-	// it is what the receiving session must be able to accept.
-	ProbeDownlink(ctx context.Context, payloadBytes int) (bool, error)
-	// Close tears the probe session down. It is safe to call twice.
-	Close() error
-}
-
-// mtuProbeResult is the outcome of one active search. Payload fields are
-// plaintext bytes; zero means "no usable size found in that direction".
-type mtuProbeResult struct {
-	UplinkPayload   int
-	DownlinkPayload int
-	Probes          int
-	CeilingHit      bool
-}
-
-// mtuProbeSearch runs the active search. It is pure: it never touches a socket
-// directly, only the link, so it can be driven by a fake in tests.
-type mtuProbeSearch struct {
-	ceiling int // plaintext ceiling
-	floor   int // plaintext floor
-	step    int // plaintext step
-	budget  int // total probe records
-	log     Logger
-}
-
-func newMTUProbeSearch(prof resolvedProfile, logger Logger) mtuProbeSearch {
-	payFloor := MaxPayloadFor(prof.mtuMin)
-	if payFloor < 1 {
-		payFloor = 1
-	}
-	payCeiling := MaxPayloadFor(prof.maxPayload)
-	if payCeiling < payFloor {
-		payCeiling = payFloor
-	}
-	payStep := prof.mtuStep
-	if payStep < 1 {
-		payStep = 1
-	}
-	return mtuProbeSearch{
-		ceiling: payCeiling,
-		floor:   payFloor,
-		step:    payStep,
-		budget:  mtuProbeBudget,
-		log:     logger,
-	}
-}
-
-// Run searches both directions over the link. It never fails the tunnel: an
-// error here means "no usable probe result", and method B takes over.
-func (s mtuProbeSearch) Run(ctx context.Context, link mtuProbeLink) mtuProbeResult {
-	var res mtuProbeResult
-
-	// Split the packet budget evenly; the uplink is searched first because it
-	// is the direction this end actually controls.
-	upBudget := s.budget / 2
-	if upBudget < 1 {
-		upBudget = 1
-	}
-	downBudget := s.budget - upBudget
-	if downBudget < 1 {
-		downBudget = 1
-	}
-
-	start := s.ceiling
-	if start > MaxPayloadFor(icmpDefaultMaxPayload) {
-		start = MaxPayloadFor(icmpDefaultMaxPayload)
-	}
-	if start < s.floor {
-		start = s.floor
-	}
-
-	up, upProbes, upCeiling := searchMaxPayload(ctx, s.floor, start, s.ceiling, upBudget,
-		func(size int) (bool, error) { return link.ProbeUplink(ctx, size) })
-	res.UplinkPayload = up
-	res.Probes += upProbes
-	res.CeilingHit = res.CeilingHit || upCeiling
-
-	down, downProbes, downCeiling := searchMaxPayload(ctx, s.floor, start, s.ceiling, downBudget,
-		func(size int) (bool, error) { return link.ProbeDownlink(ctx, size) })
-	res.DownlinkPayload = down
-	res.Probes += downProbes
-	res.CeilingHit = res.CeilingHit || downCeiling
-
-	s.log.Infof("[ICMP] mtu probe done uplink=%d downlink=%d probes=%d ceiling_hit=%t",
-		res.UplinkPayload, res.DownlinkPayload, res.Probes, res.CeilingHit)
-	return res
-}
-
-// searchMaxPayload finds the largest payload size in [floor, ceiling] for which
-// probe reports success, assuming the property is monotone: if a size succeeds,
-// every smaller size succeeds too. That assumption is what makes a binary search
-// valid, and it holds for both directions here — a smaller record is never
-// harder to deliver than a larger one.
-//
-// It spends at most budget probes, returns the best size known to work, and
-// reports whether it reached the ceiling.
-func searchMaxPayload(
-	ctx context.Context,
-	floor, start, ceiling, budget int,
-	probe func(int) (bool, error),
-) (best, probes int, ceilingHit bool) {
-	if ceiling < floor {
-		ceiling = floor
-	}
-	if start < floor {
-		start = floor
-	}
-	if start > ceiling {
-		start = ceiling
-	}
-	try := func(size int) bool {
-		probes++
-		ok, err := probe(size)
-		// A probe error is indistinguishable from "too big" for search
-		// purposes: either way this size is not usable, and the caller has
-		// method B to fall back on.
-		return err == nil && ok
-	}
-
-	// The floor must work; if it does not, no size does and there is nothing to
-	// search. Returning zero tells the caller to keep its in-band budget.
-	if !try(floor) {
-		return 0, probes, false
-	}
-	best = floor
-	if floor >= ceiling || probes >= budget {
-		return best, probes, floor >= ceiling
-	}
-
-	// Phase 1: probe the safe start, then grow geometrically so the failure
-	// point is hit in O(log n) probes rather than one step at a time.
-	if !try(start) {
-		// Worse than assumed: refine downward between the known-good floor and
-		// the failed start.
-		low, high := floor, start
-		for probes < budget && high-low > 1 {
-			mid := low + (high-low)/2
-			if try(mid) {
-				best = mid
-				low = mid
-			} else {
-				high = mid
-			}
-		}
-		return best, probes, false
-	}
-	best = start
-	if start >= ceiling || probes >= budget {
-		return best, probes, start >= ceiling
-	}
-
-	low := start
-	step := start - floor
-	if step < 1 {
-		step = 1
-	}
-	high := 0
-	for probes < budget {
-		next := low + step
-		if next > ceiling {
-			next = ceiling
-		}
-		if next <= low {
-			break
-		}
-		if try(next) {
-			best = next
-			if next >= ceiling {
-				return best, probes, true
-			}
-			low = next
-			step *= 2
-			continue
-		}
-		high = next
-		break
-	}
-	if high == 0 {
-		return best, probes, false
-	}
-
-	// Phase 2: halve the remaining gap.
-	for probes < budget && high-low > 1 {
-		mid := low + (high-low)/2
-		if try(mid) {
-			best = mid
-			low = mid
-		} else {
-			high = mid
-		}
-	}
-	return best, probes, best >= ceiling
 }

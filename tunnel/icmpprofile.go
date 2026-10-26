@@ -35,13 +35,20 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	// icmpDefaultMaxPayload is the largest complete v2 record carried by
-	// default. 1200 is deliberately conservative: it sits below the IPv6
-	// guaranteed floor (1232) and far below the IPv4 ceiling (1472), so the
-	// default path never fragments on either family. Not fragmenting matters
-	// because CGNATs commonly drop fragments outright, and because IPv6 routers
-	// never fragment at all.
-	icmpDefaultMaxPayload = 1200
+	// icmpDefaultMaxPayload is the largest complete v2 record the automatic
+	// search may reach: the IPv6 ceiling, so a record of this size fills a
+	// 1500-byte path exactly and never fragments.
+	icmpDefaultMaxPayload = icmpV6MaxPayload
+
+	// icmpSafeStartPayload is where an adapting budget starts. It is
+	// deliberately conservative: below the IPv6 guaranteed floor (1232) and
+	// far below the IPv4 ceiling (1472), so the very first record cannot
+	// fragment on either family. Not fragmenting matters because CGNATs
+	// commonly drop fragments outright, and because IPv6 routers never
+	// fragment at all. The gap between this and icmpDefaultMaxPayload is the
+	// room in-band adaptation has to grow into — without it the default budget
+	// starts at its own ceiling and can only ever shrink.
+	icmpSafeStartPayload = 1200
 
 	// Per-family ceilings for the complete-record budget:
 	//   IPv4: 1500 - 20 (IPv4 header) - 8 (ICMP header)   = 1472
@@ -58,7 +65,7 @@ const (
 	icmpDefaultMTUStep  = 100
 	icmpDefaultPaceMS   = 20
 	icmpDefaultBlockTO  = 60 * time.Second
-	icmpDefaultMTUMode  = "probe"
+	icmpDefaultMTUMode  = "auto"
 	icmpDefaultPollsIF  = 4
 	icmpDefaultIdleMS   = 1000
 	icmpDefaultKeepMS   = 15000
@@ -84,12 +91,16 @@ const (
 // A leftover `family` key in an existing config is therefore ignored, not an
 // error.
 type ICMPProfile struct {
-	// MaxPayload is the largest complete v2 record to carry. It is both the
-	// starting point and the hard ceiling of the automatic MTU search.
+	// MaxPayload is the hard ceiling of the complete-record budget: the
+	// largest record this end will ever emit, and the largest it must accept.
+	// An adapting budget starts at icmpSafeStartPayload instead, and grows
+	// toward MaxPayload only with evidence — so a high MaxPayload is what gives
+	// the search room to be worth anything. It does not loosen the safety
+	// property: a record of MaxPayload bytes fits a 1500-byte path.
 	MaxPayload int `json:"max_payload"`
-	// MTUMode is "probe" (handshake-time active probe plus in-band
-	// adaptation), "auto" (in-band adaptation only) or "fixed" (trust
-	// MaxPayload and never adapt).
+	// MTUMode is "auto" (in-band adaptation, the default) or "fixed" (trust
+	// MaxPayload and never adapt). "probe" is accepted as a deprecated alias
+	// for "auto": the active probe it named was never wired to a caller.
 	MTUMode string `json:"mtu_mode"`
 	// MTUMin is the floor the search will never step below.
 	MTUMin int `json:"mtu_min"`
@@ -106,9 +117,9 @@ type ICMPProfile struct {
 	// charged per destination IP against a global allowance. Spreading ids
 	// diversifies NAT and middlebox flow keys; it cannot multiply an allowance.
 	IDRange string `json:"id_range"`
-	// Probe enables the optional server-initiated reverse probe. It is
-	// best-effort by nature (see DESIGN_ICMP.md §4.9) and degrades to
-	// client-driven polling after repeated failure. nil means enabled.
+	// Probe enables the server-initiated reverse probe. It is dormant: nothing
+	// calls the carrier's Probe outlet yet, so the flag is accepted and stored
+	// and has no effect. nil means enabled.
 	Probe *bool `json:"probe"`
 	// PollsInFlight is the client's sliding request window, i.e. the hard
 	// ceiling on downlink throughput (~ window / RTT).
@@ -820,13 +831,15 @@ func (r *recentSeqs) contains(seq uint16) bool {
 // packet leaves the machine: id selection, pacing, the health classifier, and
 // the automatic MTU controller. Both platform carriers delegate to it.
 type icmpCore struct {
-	ids    idProvider
-	pace   *pacer
-	mtu    *mtuController
-	mon    *carrierMonitor
-	book   *pokeBook
-	logger Logger
-	recent recentSeqs
+	ids          idProvider
+	pace         *pacer
+	paceBase     time.Duration // the configured pace, restored by waitPace on recovery
+	blockTimeout time.Duration // also the send spacing while the carrier is blocked
+	mtu          *mtuController
+	mon          *carrierMonitor
+	book         *pokeBook
+	logger       Logger
+	recent       recentSeqs
 
 	probeEnabled bool
 	probeFails   atomic.Int32
@@ -842,6 +855,8 @@ func newICMPCore(prof resolvedProfile, peer netip.AddrPort, ids idProvider, logg
 	return &icmpCore{
 		ids:          ids,
 		pace:         newPacer(prof.pace),
+		paceBase:     prof.pace,
+		blockTimeout: prof.blockTimeout,
 		mtu:          newMTUController(prof.mtuMode, prof.maxPayload, prof.mtuMin, prof.mtuStep),
 		mon:          newCarrierMonitor(peer, prof.pace, prof.blockTimeout, logger),
 		book:         newPokeBook(),
@@ -906,9 +921,21 @@ func (c *icmpCore) waitPace(ctx context.Context) error {
 	// limit says nothing about the path MTU, and probing a throttled path makes
 	// the limit worse.
 	switch c.mon.State() {
-	case CarrierThrottled, CarrierBlocked:
+	case CarrierThrottled:
+		// Doubling the retransmit floor is only half the reaction. The path is
+		// congested, so the send rate is what has to give way; a sender that
+		// keeps offering the same packets per second keeps the limit in place
+		// and the classifier never gets to observe a recovery.
+		c.pace.setInterval(2 * c.paceBase)
+		c.mtu.setSuspended(true)
+	case CarrierBlocked:
+		// No reply at all: probe the path as slowly as we retransmit it rather
+		// than spending the host's global ICMP allowance on packets nobody can
+		// see. Inbound traffic still clears the state immediately.
+		c.pace.setInterval(c.blockTimeout)
 		c.mtu.setSuspended(true)
 	default:
+		c.pace.setInterval(c.paceBase)
 		c.mtu.setSuspended(false)
 	}
 	return nil
@@ -970,13 +997,6 @@ func (c *icmpCore) receiveCeiling() int { return c.mtu.receiveCeiling() }
 func (c *icmpCore) recordAcked(size int) { c.mtu.recordAcked(size) }
 
 func (c *icmpCore) recordLost(size int) { c.mtu.recordLost(size) }
-
-// adoptProbedBudget applies an active-probe result, which is stronger evidence
-// than in-band guessing.
-func (c *icmpCore) adoptProbedBudget(budget int) { c.mtu.adoptProbed(budget) }
-
-// mtuProbeWanted reports whether the active probe should be attempted at all.
-func (c *icmpCore) mtuProbeWanted() bool { return c.mtu.modeOf() == mtuProbe }
 
 func (c *icmpCore) carrierState() CarrierState { return c.mon.State() }
 

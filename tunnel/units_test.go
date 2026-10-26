@@ -32,7 +32,6 @@ func TestMTUModeStrings(t *testing.T) {
 	cases := map[mtuMode]string{
 		mtuFixed:   "fixed",
 		mtuInBand:  "auto",
-		mtuProbe:   "probe",
 		mtuMode(9): "unknown",
 	}
 	for mode, want := range cases {
@@ -42,7 +41,7 @@ func TestMTUModeStrings(t *testing.T) {
 	}
 	// The string must round-trip through the parser, because it is what
 	// appears in the config file and in the startup log line.
-	for _, mode := range []mtuMode{mtuFixed, mtuInBand, mtuProbe} {
+	for _, mode := range []mtuMode{mtuFixed, mtuInBand} {
 		got, err := parseMTUMode(mode.String())
 		if err != nil {
 			t.Fatalf("parseMTUMode(%q): %v", mode.String(), err)
@@ -51,14 +50,25 @@ func TestMTUModeStrings(t *testing.T) {
 			t.Fatalf("parseMTUMode(%q) = %v, want %v", mode.String(), got, mode)
 		}
 	}
+	// "probe" is a deprecated alias for the mode that replaced it: configs
+	// written before the active probe was removed must keep resolving.
+	for _, alias := range []string{"probe", "PROBE", " auto", "in-band", "inband"} {
+		got, err := parseMTUMode(alias)
+		if err != nil {
+			t.Fatalf("parseMTUMode(%q): %v", alias, err)
+		}
+		if got != mtuInBand {
+			t.Fatalf("parseMTUMode(%q) = %v, want auto", alias, got)
+		}
+	}
 }
 
 func TestMTUControllerModeOf(t *testing.T) {
 	if got := newMTUController(mtuFixed, 1200, 548, 100).modeOf(); got != mtuFixed {
 		t.Fatalf("modeOf = %v, want fixed", got)
 	}
-	if got := newMTUController(mtuProbe, 1200, 548, 100).modeOf(); got != mtuProbe {
-		t.Fatalf("modeOf = %v, want probe", got)
+	if got := newMTUController(mtuInBand, 1200, 548, 100).modeOf(); got != mtuInBand {
+		t.Fatalf("modeOf = %v, want auto", got)
 	}
 }
 
@@ -179,29 +189,40 @@ func TestPokeBookTracksOutstandingPolls(t *testing.T) {
 }
 
 func TestICMPCoreMTUHelpers(t *testing.T) {
-	resolved, err := (ICMPProfile{MaxPayload: 1452, MTUMode: "probe", PaceMS: 1}).resolve()
-	if err != nil {
-		t.Fatal(err)
-	}
 	ids, err := newPooledIDs("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	core := newICMPCore(resolved, testICMPPeer, ids, Nop{})
 
-	if !core.mtuProbeWanted() {
-		t.Fatal("mtu_mode=probe must request the active probe")
+	// "probe" is a deprecated alias: it must resolve exactly like "auto",
+	// because the active probe it named is no longer wired to a caller.
+	alias, err := (ICMPProfile{MaxPayload: 1452, MTUMode: "probe", PaceMS: 1}).resolve()
+	if err != nil {
+		t.Fatal(err)
 	}
-	// A probe result is stronger than in-band guessing, so it is adopted
-	// outright rather than stepped towards.
-	core.adoptProbedBudget(1300)
-	if got := core.maxRecordSize(); got != 1300 {
-		t.Fatalf("budget after adoptProbedBudget = %d, want 1300", got)
+	auto, err := (ICMPProfile{MaxPayload: 1452, MTUMode: "auto", PaceMS: 1}).resolve()
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The kernel refusing a size is the same information, taken earlier.
-	core.noteSendTooLarge(1300)
-	if got := core.maxRecordSize(); got != 1200 {
-		t.Fatalf("budget after noteSendTooLarge = %d, want 1200 (1300 - step)", got)
+	if alias != auto {
+		t.Fatal("mtu_mode=probe must resolve identically to mtu_mode=auto")
+	}
+
+	core := newICMPCore(auto, testICMPPeer, ids, Nop{})
+	// The ceiling is what the operator asked for and never moves. The budget
+	// starts conservative, so the very first record cannot fragment, and only
+	// grows into that room with in-band evidence.
+	if got := core.receiveCeiling(); got != 1452 {
+		t.Fatalf("receive ceiling = %d, want 1452", got)
+	}
+	if got := core.maxRecordSize(); got != icmpSafeStartPayload {
+		t.Fatalf("initial budget = %d, want %d", got, icmpSafeStartPayload)
+	}
+	// The kernel refusing a size is authoritative: step down at once, rather
+	// than waiting for a loss counter to fill.
+	core.noteSendTooLarge(core.maxRecordSize())
+	if got := core.maxRecordSize(); got != icmpSafeStartPayload-icmpDefaultMTUStep {
+		t.Fatalf("budget after noteSendTooLarge = %d, want %d", got, icmpSafeStartPayload-icmpDefaultMTUStep)
 	}
 
 	fixed, err := (ICMPProfile{MaxPayload: 1452, MTUMode: "fixed", PaceMS: 1}).resolve()
@@ -209,8 +230,14 @@ func TestICMPCoreMTUHelpers(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixedCore := newICMPCore(fixed, testICMPPeer, ids, Nop{})
-	if fixedCore.mtuProbeWanted() {
-		t.Fatal("mtu_mode=fixed must not request the active probe")
+	if got := fixedCore.maxRecordSize(); got != 1452 {
+		t.Fatalf("fixed budget = %d, want the ceiling 1452", got)
+	}
+	// Fixed mode trusts the operator's number: path evidence must not move it.
+	fixedCore.noteSendTooLarge(1452)
+	fixedCore.recordLost(1452)
+	if got := fixedCore.maxRecordSize(); got != 1452 {
+		t.Fatalf("fixed budget moved to %d under path evidence", got)
 	}
 }
 

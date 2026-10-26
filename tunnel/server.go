@@ -89,6 +89,21 @@ const (
 	// kept before the cleanup loop reaps it.
 	serverIdleTimeout = 60 * time.Second
 	cleanupInterval   = 15 * time.Second
+
+	// serverMaxRetries is how many retransmissions one record may have before
+	// the session is torn down. It matches the client's clientMaxRetries: a
+	// record that will not get through is not worth keeping a session alive for.
+	serverMaxRetries = 15
+
+	// maxUDPDatagram is the largest UDP payload an IP packet can carry
+	// (65535 - 20 IPv4 header - 8 UDP header, rounded up). A "udp" backend must
+	// be read whole: reading it into a smaller buffer truncates the datagram
+	// silently.
+	maxUDPDatagram = 65507
+
+	// backendWriteTimeout bounds one backend write from the tunnel. It is the
+	// server's half of the client's clientAppWriteTimeout.
+	backendWriteTimeout = 5 * time.Second
 )
 
 // synCacheTTL is how long a verified handshake nonce is remembered. It must
@@ -1562,6 +1577,12 @@ func (sess *ServerSession) writeToTarget(data []byte) error {
 	if sess.upstream == nil {
 		return errors.New("target connection unavailable")
 	}
+	// Bound the write. Delivery runs inside the server's single readLoop, so an
+	// unbounded write to a backend that stopped reading would stall every
+	// session on that server, not just this one. The client applies the same
+	// bound to its local end; without it the two halves of the tunnel behave
+	// differently when the application hangs.
+	_ = sess.upstream.SetWriteDeadline(time.Now().Add(backendWriteTimeout))
 	if sess.targetNetwork == "udp" {
 		n, err := sess.upstream.Write(data)
 		if err == nil && n != len(data) {
@@ -1674,6 +1695,13 @@ func (sess *ServerSession) upstreamLoop() {
 	if bufSize <= 0 {
 		bufSize = MaxPayloadLen
 	}
+	if sess.targetNetwork == "udp" {
+		// A UDP read must take the whole datagram: the kernel silently discards
+		// whatever spills past the buffer, which would corrupt traffic that no
+		// error could ever report. Oversized datagrams are refused loudly by
+		// sendData instead.
+		bufSize = maxUDPDatagram
+	}
 	buf := make([]byte, bufSize)
 	for {
 		if sess.isClosed() {
@@ -1740,20 +1768,20 @@ func (sess *ServerSession) retransmitLoop() {
 				if now.Sub(pkt.sentTime) < wait {
 					continue
 				}
-				if pkt.retries >= 15 {
+				// Feed the timeout as MTU evidence now, not only on abandon.
+				// The record has already been told it was too big by the time
+				// the retries run out, and the carrier's classifier suppresses
+				// this while the path is throttled.
+				if fed != nil {
+					fed.RecordLost(len(pkt.wire))
+				}
+				pkt.retries++
+				if pkt.retries > serverMaxRetries {
 					sess.server.logWarn("[Session 0x%08X] max retries reached for Seq %d, closing session", sess.sessionID, seq)
-					if fed != nil {
-						// One more record that exhausted its retransmissions at
-						// this size is exactly the evidence in-band MTU
-						// adaptation shrinks on (when the carrier is healthy
-						// enough for the signal to be trusted).
-						fed.RecordLost(len(pkt.wire))
-					}
 					delete(sess.unacked, seq)
 					abandon = true
 					break
 				}
-				pkt.retries++
 				pkt.sentTime = now
 				pkt.rto = minDuration(pkt.rto*3/2, sess.rttEst.maxRTT)
 				toSend = append(toSend, pkt)

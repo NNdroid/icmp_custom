@@ -466,6 +466,11 @@ func (c *Client) dispatch(raw []byte, rec *Record) {
 	if c.authFed != nil {
 		c.authFed.RecordAuthenticated()
 	}
+	// Count the answer BEFORE the replay filter, on purpose: poke() counted
+	// every record we emitted as an outstanding request, and on this carrier a
+	// retransmitted record is still an Echo Reply discharging one of them.
+	// Withholding the credit here would stall the downlink through any loss
+	// episode until the window's stall timer fired.
 	sess.noteAnswered()
 	if !sess.replayFilter.Accept(rec.PacketNo) {
 		if rec.Cmd == CmdData {
@@ -1118,14 +1123,18 @@ func (s *clientSession) retransmitLoop() {
 				if now.Sub(pkt.sentTime) < wait {
 					continue
 				}
+				// Feed the timeout as MTU evidence now, not only on abandon. By
+				// the time the retries are exhausted it is ~76s out at the RTO
+				// floor — an undersized budget would have spent all of that
+				// overshooting a path it had already been told was narrow. The
+				// carrier's classifier suppresses this while throttled, so a
+				// rate-limited path cannot be mistaken for a narrow one.
+				if fed != nil {
+					fed.RecordLost(len(pkt.wire))
+				}
 				pkt.retries++
 				if pkt.retries > clientMaxRetries {
 					s.client.logWarn("[Client] [Session 0x%08X] Seq %d abandoned after %d retries", s.sid, seq, pkt.retries)
-					if fed != nil {
-						// Evidence for in-band MTU adaptation: this record
-						// exhausted its retransmissions at that size.
-						fed.RecordLost(len(pkt.wire))
-					}
 					delete(s.unacked, seq)
 					abandon = true
 					break

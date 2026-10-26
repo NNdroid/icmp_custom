@@ -312,21 +312,21 @@ func BenchmarkPacerAdmission(b *testing.B) {
 
 func BenchmarkMTUController(b *testing.B) {
 	b.Run("record-acked", func(b *testing.B) {
-		m := newMTUController(mtuProbe, 1400, icmpMinPayload, 100)
+		m := newMTUController(mtuInBand, 1400, icmpMinPayload, 100)
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			m.recordAcked(1200)
 		}
 	})
 	b.Run("shrink-for-oversize", func(b *testing.B) {
-		m := newMTUController(mtuProbe, 1400, icmpMinPayload, 100)
+		m := newMTUController(mtuInBand, 1400, icmpMinPayload, 100)
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			m.shrinkForOversize(1400)
 		}
 	})
 	b.Run("budget-read", func(b *testing.B) {
-		m := newMTUController(mtuProbe, 1400, icmpMinPayload, 100)
+		m := newMTUController(mtuInBand, 1400, icmpMinPayload, 100)
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			_ = m.budget()
