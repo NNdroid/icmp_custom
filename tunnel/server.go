@@ -538,26 +538,28 @@ func (s *Server) handleHandshake(path PathID, rec *Record, matchedPSK string) {
 	}
 
 	sess := &ServerSession{
-		server:        s,
-		sessionID:     sid,
-		raddr:         path.Peer,
-		pathID:        path,
-		pathValid:     true, // the handshake itself proved this path works
-		targetNetwork: targetNet,
-		targetAddr:    targetHostPort,
-		upstream:      upstream,
-		frameKeys:     frameKeys,
-		recvQueue:     make(map[uint64][]byte),
-		unacked:       make(map[uint64]*unackedPkt),
-		lastActive:    time.Now(),
-		closeChan:     make(chan struct{}),
+		server:         s,
+		sessionID:      sid,
+		raddr:          path.Peer,
+		pathID:         path,
+		pathValid:      true, // the handshake itself proved this path works
+		targetNetwork:  targetNet,
+		targetAddr:     targetHostPort,
+		upstream:       upstream,
+		frameKeys:      frameKeys,
+		recvQueue:      make(map[uint64][]byte),
+		unacked:        make(map[uint64]*unackedPkt),
+		lastActive:     time.Now(),
+		closeChan:      make(chan struct{}),
+		deliverWake:    make(chan struct{}, 1),
+		retransmitWake: make(chan struct{}, 1),
 		// See the client session's note: the lower clamp is rtoFloorNet so a
 		// fast path converges to its real round trip instead of being pinned at
 		// the seed RTO for the life of the session.
 		rttEst: newRTTEstimator(200*time.Millisecond, rtoFloorNet, 10*time.Second),
 	}
 	sess.sendSeq.Store(1)
-	sess.recvSeq.Store(1)
+	sess.nextDeliverSeq.Store(1)
 	sess.unackedLow = 1
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	s.sessions.Store(sid, sess)
@@ -613,7 +615,7 @@ func (s *Server) handleHandshake(path PathID, rec *Record, matchedPSK string) {
 		return
 	default:
 	}
-	s.wg.Add(2)
+	s.wg.Add(3)
 	go func() {
 		defer s.wg.Done()
 		sess.upstreamLoop()
@@ -621,6 +623,10 @@ func (s *Server) handleHandshake(path PathID, rec *Record, matchedPSK string) {
 	go func() {
 		defer s.wg.Done()
 		sess.retransmitLoop()
+	}()
+	go func() {
+		defer s.wg.Done()
+		sess.deliverLoop()
 	}()
 }
 
@@ -1145,12 +1151,29 @@ type ServerSession struct {
 
 	sendPacketNo atomic.Uint64
 	sendSeq      atomic.Uint64
-	recvSeq      atomic.Uint64
+	// nextDeliverSeq and ackedSeq split what used to be one recvSeq counter:
+	// nextDeliverSeq is the next in-order seq the receive loop will ENQUEUE
+	// (advanced the moment a record is buffered, single writer: readLoop);
+	// ackedSeq is the highest seq actually WRITTEN to the backend (single
+	// writer: the delivery goroutine). The cumulative ACK reports ackedSeq —
+	// only real delivery retires the peer's retransmit obligation.
+	nextDeliverSeq atomic.Uint64
+	ackedSeq       atomic.Uint64
 
 	rttEst *rttEstimator
 
+	// recvQueue holds every authenticated, not-yet-written DATA payload keyed
+	// by seq: both in-order records awaiting the delivery goroutine and
+	// out-of-order records awaiting the hole below them. Capped by the
+	// server's maxRecvQueue.
 	recvQueue map[uint64][]byte
 	recvMu    sync.Mutex
+
+	// deliverWake nudges the delivery goroutine after a successful enqueue;
+	// retransmitWake tells the retransmit loop the outstanding set changed
+	// (a record was added) so it can re-arm to an earlier deadline.
+	deliverWake    chan struct{}
+	retransmitWake chan struct{}
 
 	unacked     map[uint64]*unackedPkt
 	unackedLow  uint64 // lowest still-unacked seq; the unacked map is contiguous [unackedLow, max]
@@ -1306,7 +1329,7 @@ func (sess *ServerSession) verifyInboundRecord(rec *Record, path PathID) bool {
 		return false
 	}
 	// The single receive loop owns this record until dispatch returns; DATA
-	// retained for reordering is copied by handleDataFromPath.
+	// retained for delivery is copied by enqueueDataFromPath.
 	plain, err := OpenRecordAEADInto(rec.Data[:0], rec, sess.frameKeys.Recv)
 	if err != nil {
 		if n := sess.server.macFailures.Add(1); n == 1 || n%100 == 0 {
@@ -1350,12 +1373,12 @@ func (sess *ServerSession) handleIncomingRecord(rec *Record, path PathID) bool {
 		return false
 	}
 	if rec.Cmd == CmdData {
-		// Record the observed path before dispatching: a DATA record that
-		// kills the session (target write failure) must still leave a reply
-		// path for the FIN that Close emits — otherwise the client hangs
-		// until its own idle timeout.
+		// Record the observed path before dispatching: a delivery failure
+		// closes the session, and the FIN its Close emits must have a reply
+		// path to leave on — otherwise the client hangs until its own idle
+		// timeout.
 		sess.setPath(path)
-		return sess.handleDataFromPath(rec, path)
+		return sess.enqueueDataFromPath(rec, path)
 	}
 
 	sess.updateRemoteAddr(path.Peer, false)
@@ -1456,11 +1479,11 @@ func (sess *ServerSession) sendToSession(data []byte) {
 	}
 }
 
+// currentAck is the cumulative ACK this end advertises: the highest seq
+// actually written to the backend, not the enqueue watermark. Only real
+// delivery retires the peer's retransmit obligation.
 func (sess *ServerSession) currentAck() uint64 {
-	if next := sess.recvSeq.Load(); next > 0 {
-		return next - 1
-	}
-	return 0
+	return sess.ackedSeq.Load()
 }
 
 func (sess *ServerSession) handleAck(ackSeq uint64) {
@@ -1511,89 +1534,140 @@ func (sess *ServerSession) handleAck(ackSeq uint64) {
 	sess.unackedCond.Broadcast()
 }
 
-func (sess *ServerSession) handleDataFromPath(rec *Record, path PathID) bool {
-	// Authentication/decryption and packet-number replay filtering have already
-	// completed in the receive path.
-	payload := rec.Data
+// enqueueDataFromPath buffers one authenticated DATA record for delivery.
+//
+// This is the receive loop's ENTIRE data job now: authentication, replay
+// filtering and this enqueue happen on the single receive path, and the actual
+// backend write runs on the session's delivery goroutine (deliverLoop). A
+// backend that stopped reading therefore stalls only its own session's
+// delivery — bounded by the queue below — instead of pinning the one receive
+// loop every session on the server shares.
+//
+// It returns false only when the delivery queue is full: processIncomingRecord
+// then rolls the packet number back so the peer's byte-identical
+// retransmission is accepted once the queue drains.
+func (sess *ServerSession) enqueueDataFromPath(rec *Record, path PathID) bool {
 	if rec.Ack > 0 {
 		sess.handleAck(rec.Ack)
 	}
 
-	expected := sess.recvSeq.Load()
-	if rec.Seq != expected {
-		if rec.Seq < expected {
-			// Already delivered. The peer is retransmitting because it never
-			// saw our ACK, so re-ACK (cumulative) instead of silently dropping —
-			// otherwise it would keep retrying until it gave up and tore the
-			// session down.
-			sess.sendCumulativeACK(expected-1, path)
-			return true
+	next := sess.nextDeliverSeq.Load()
+	if rec.Seq < next {
+		// Already enqueued — possibly buffered but not yet written. The peer
+		// is retransmitting because it never saw our ACK, so re-ACK the
+		// progress that has actually been DELIVERED (ackedSeq, not the
+		// enqueue watermark) instead of silently dropping — otherwise it
+		// would keep retrying until it gave up and tore the session down.
+		if ack := sess.ackedSeq.Load(); ack > 0 {
+			sess.sendCumulativeACK(ack, path)
 		}
-		// Out-of-order: buffer the payload and wait for the missing one to be
-		// retransmitted. We deliberately do NOT Ack here, so the client keeps
-		// the missing sequence outstanding and resends it.
-		sess.recvMu.Lock()
-		accepted := true
-		if _, dup := sess.recvQueue[rec.Seq]; !dup {
-			if len(sess.recvQueue) >= sess.server.maxRecvQueue {
-				sess.server.queueFullDrops.Add(1)
-				accepted = false
-			} else {
-				sess.recvQueue[rec.Seq] = append([]byte(nil), payload...)
-			}
-		}
-		sess.recvMu.Unlock()
-		if accepted {
-			sess.updateRemoteAddr(path.Peer, true)
-			sess.setPath(path)
-			sess.touch()
-		}
-		return accepted
+		return true
 	}
 
-	// Only a fresh authenticated DATA record may migrate the session or install
-	// a reply path.
-	sess.updateRemoteAddr(path.Peer, true)
-	sess.setPath(path)
-	sess.touch()
-
-	// In-order delivery. Gather the contiguous run (this record plus anything
-	// already buffered behind it) under the lock, then deliver OUTSIDE the lock
-	// so a slow target write cannot stall the receive path.
-	type pending struct {
-		seq     uint64
-		payload []byte
-	}
-	run := []pending{{seq: expected, payload: payload}}
 	sess.recvMu.Lock()
-	next := expected + 1
+	if _, dup := sess.recvQueue[rec.Seq]; !dup {
+		// The queue-full rejection applies ONLY to a record beyond the next
+		// expected seq: it is optional reorder buffering, and refusing it is
+		// safe (the peer retransmits). The hole-filling record — seq ==
+		// nextDeliverSeq — must always get in: it completes the contiguous
+		// run the delivery goroutine is waiting for, so refusing it while the
+		// queue holds only records AFTER the hole would stall the session
+		// forever. Accepting it overshoots the cap by exactly one record,
+		// which the drain immediately retires.
+		if rec.Seq > next && len(sess.recvQueue) >= sess.server.maxRecvQueue {
+			sess.recvMu.Unlock()
+			sess.server.queueFullDrops.Add(1)
+			return false
+		}
+		sess.recvQueue[rec.Seq] = append([]byte(nil), rec.Data...)
+		// Only a HOLE-FILLING record (seq == next) may advance the enqueue
+		// watermark, and it advances across the contiguous run that just
+		// became complete. An out-of-order record must leave the watermark
+		// alone: the hole BELOW it is still open, and advancing past it would
+		// make the retransmission that fills that hole look like an
+		// already-enqueued duplicate — it would be re-ACKed and never
+		// delivered, stalling the session permanently.
+		if rec.Seq == next {
+			high := rec.Seq
+			for {
+				if _, ok := sess.recvQueue[high+1]; !ok {
+					break
+				}
+				high++
+			}
+			sess.nextDeliverSeq.Store(high + 1)
+		}
+	}
+	sess.recvMu.Unlock()
+
+	// A fresh authenticated DATA record may migrate the session (same-IP NAT
+	// rebinding) and refresh activity.
+	sess.updateRemoteAddr(path.Peer, true)
+	sess.touch()
+	nudge(sess.deliverWake)
+	return true
+}
+
+// deliverLoop is the session's only backend writer.
+//
+// It drains the contiguous run of enqueued records starting at ackedSeq+1 and
+// advances the cumulative ACK with REAL delivery progress: a record is
+// acknowledged only after its bytes reached the backend, so the peer's
+// retransmit obligation ends exactly where the data is safe. Per-session
+// ordering is preserved by construction — one goroutine, sequence order.
+func (sess *ServerSession) deliverLoop() {
+	for {
+		if sess.isClosed() {
+			return
+		}
+		if sess.deliverPending() {
+			// Wrote something; there may be more already enqueued behind it.
+			continue
+		}
+		select {
+		case <-sess.closeChan:
+			return
+		case <-sess.deliverWake:
+		}
+	}
+}
+
+// deliverPending drains and writes one contiguous run. It reports whether
+// anything was written; a backend write failure closes the session (its FIN
+// rides the path the last DATA set) and abandons the rest of the run — no ACK
+// is sent for any of it, so the peer retransmits into a closed session and
+// nothing is silently acknowledged.
+func (sess *ServerSession) deliverPending() bool {
+	sess.recvMu.Lock()
+	var run [][]byte
+	next := sess.ackedSeq.Load() + 1
 	for {
 		raw, ok := sess.recvQueue[next]
 		if !ok {
 			break
 		}
 		delete(sess.recvQueue, next)
-		run = append(run, pending{seq: next, payload: raw})
+		run = append(run, raw)
 		next++
 	}
 	sess.recvMu.Unlock()
-
-	delivered := uint64(0)
-	for _, p := range run {
-		if err := sess.writeToTarget(p.payload); err != nil {
+	if len(run) == 0 {
+		return false
+	}
+	for _, payload := range run {
+		if err := sess.writeToTarget(payload); err != nil {
 			sess.server.logWarn("[Session 0x%08X] target write failed: %v", sess.sessionID, err)
 			sess.Close()
 			return true
 		}
-		delivered++
 	}
-	if delivered == 0 {
-		return true
+	sess.ackedSeq.Store(next - 1)
+	// Ack the highest contiguous sequence actually delivered. The reply path
+	// is the session's most recently observed one (the last DATA's arrival
+	// path), which is what every other server-initiated record uses too.
+	if p, ok := sess.lastPath(); ok {
+		sess.sendCumulativeACK(next-1, p)
 	}
-	sess.recvSeq.Store(expected + delivered)
-
-	// Ack the highest contiguous sequence just delivered.
-	sess.sendCumulativeACK(expected+delivered-1, path)
 	return true
 }
 
@@ -1726,6 +1800,9 @@ func (sess *ServerSession) sendData(payload []byte) error {
 		rto:       sess.rttEst.RTO(),
 	}
 	sess.unackedMu.Unlock()
+	// The retransmit loop may be parked with its timer disarmed (nothing was
+	// outstanding): tell it the outstanding set changed so it re-arms.
+	nudge(sess.retransmitWake)
 
 	// Server-initiated: mirror the most recently observed path so whatever
 	// demultiplexing the peer requires keeps working.
@@ -1784,70 +1861,65 @@ func (sess *ServerSession) upstreamLoop() {
 	}
 }
 
+// retransmitLoop sleeps until the earliest outstanding record is due (or the
+// outstanding set changes, or the session closes) and sweeps then. It replaces
+// the fixed 50ms ticker: a quiet session costs zero wake-ups, and a busy one
+// wakes at the rate of actual retransmission events. A carrier floor change
+// costs one early wake whose sweep finds nothing due and re-arms — the same
+// "re-read the floor" behaviour the ticker had, minus the 20 wake-ups per
+// second per session that paid for it.
 func (sess *ServerSession) retransmitLoop() {
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
 	for {
+		if sess.isClosed() {
+			return
+		}
+		// Arm to the earliest due record. With nothing outstanding the timer
+		// is disarmed: sendData nudges retransmitWake when work returns. The
+		// outstanding map is mutated by sendData and handleAck: read it under
+		// its own mutex.
+		sess.unackedMu.Lock()
+		d, ok := earliestRetransmitDelay(sess.unacked, conditionFloorOf(sess.server.cond))
+		sess.unackedMu.Unlock()
+		if ok {
+			timer.Reset(d)
+		} else {
+			timer.Stop()
+		}
 		select {
 		case <-sess.closeChan:
 			return
-		case <-ticker.C:
-			now := time.Now()
-			// The carrier may declare a floor above the estimator's RTO — a
-			// throttled path cannot answer faster than its own pace, and a
-			// blocked one must not be probed faster than its block timeout, or
-			// every retransmit is more fuel on a fire that is already being
-			// rate-limited. A responsive path tracks the observed RTT, and a
-			// carrier that declares no floor returns zero and lets the estimator
-			// govern. Re-read it each tick because it moves with the carrier's
-			// classification; the capability itself was resolved once at
-			// construction (Server.cond), so this is a virtual call, not a
-			// per-tick interface assertion.
-			floor := conditionFloorOf(sess.server.cond)
-			fed := sess.server.mtuFed
-			// Collect the records due for retransmission under the lock, then
-			// send them OUTSIDE it: sendToSession can block on the carrier, and
-			// holding unackedMu across it would stall the upstream pump parked
-			// on the send window.
-			var toSend []*unackedPkt
-			abandon := false
-			sess.unackedMu.Lock()
-			for seq, pkt := range sess.unacked {
-				wait := pkt.rto
-				if wait < floor {
-					wait = floor
-				}
-				if now.Sub(pkt.sentTime) < wait {
-					continue
-				}
-				// Feed the timeout as MTU evidence now, not only on abandon.
-				// The record has already been told it was too big by the time
-				// the retries run out, and the carrier's classifier suppresses
-				// this while the path is throttled.
-				if fed != nil {
-					fed.RecordLost(len(pkt.wire))
-				}
-				pkt.retries++
-				if pkt.retries > serverMaxRetries {
-					sess.server.logWarn("[Session 0x%08X] max retries reached for Seq %d, closing session", sess.sessionID, seq)
-					delete(sess.unacked, seq)
-					abandon = true
-					break
-				}
-				pkt.sentTime = now
-				pkt.rto = minDuration(pkt.rto*3/2, sess.rttEst.maxRTT)
-				toSend = append(toSend, pkt)
-			}
-			sess.unackedMu.Unlock()
-			if abandon {
-				sess.Close()
-				return
-			}
-			for _, pkt := range toSend {
-				sess.sendToSession(pkt.wire)
+		case <-sess.retransmitWake:
+			// A record was added: recompute the deadline.
+		case <-timer.C:
+			if !sess.sweepRetransmissions() {
+				return // a record exhausted its retries; the session is closing
 			}
 		}
 	}
+}
+
+// sweepRetransmissions retransmits every record whose effective timeout has
+// elapsed and tears the session down when one exhausts its retries. It
+// reports false when the session must stop sweeping.
+func (sess *ServerSession) sweepRetransmissions() bool {
+	sweep := &retransmitSweep{
+		mu:         &sess.unackedMu,
+		floor:      conditionFloorOf(sess.server.cond),
+		fed:        sess.server.mtuFed,
+		unacked:    sess.unacked,
+		rttMax:     sess.rttEst.maxRTT,
+		maxRetries: serverMaxRetries,
+		onAbandon: func(seq uint64) {
+			sess.server.logWarn("[Session 0x%08X] max retries reached for Seq %d, closing session", sess.sessionID, seq)
+			sess.Close()
+		},
+		onRetransmit: func(pkt *unackedPkt) {
+			sess.sendToSession(pkt.wire)
+		},
+	}
+	return sweep.run()
 }
 
 // Close tears the session down exactly once.

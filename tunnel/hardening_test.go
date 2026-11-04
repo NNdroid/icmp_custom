@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/netip"
 	"sync"
 	"testing"
@@ -123,9 +124,10 @@ func newAckTestServerSession(t *testing.T) *ServerSession {
 func newAckTestClientSession(t *testing.T) *clientSession {
 	t.Helper()
 	sess := &clientSession{
-		client:    &Client{},
-		frameKeys: &FrameKeys{},
-		rttEst:    newRTTEstimator(200*time.Millisecond, rtoFloorNet, 10*time.Second),
+		client:     &Client{},
+		frameKeys:  &FrameKeys{},
+		rttEst:     newRTTEstimator(200*time.Millisecond, rtoFloorNet, 10*time.Second),
+		lastActive: time.Now(),
 	}
 	sess.sendSeq.Store(2)
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
@@ -275,5 +277,214 @@ func TestSynCacheRemembersAndResetsSource(t *testing.T) {
 	expired := now.Add(synCacheTTL + time.Minute)
 	if _, owner, src := c.Acquire(key, expired, b); !owner || src.IsValid() {
 		t.Fatalf("post-TTL Acquire: owner=%v src=%v, want a fresh reservation", owner, src)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Delivery / retransmission engine regression tests (arq.go, deliverLoop,
+// enqueue watermark). Each pins a failure mode the redesign could reintroduce.
+// ---------------------------------------------------------------------------
+
+// newDeliveryTestServerSession builds a ServerSession wired for delivery-unit
+// tests: a discard sink upstream, a tiny receive queue, and clean watermarks.
+func newDeliveryTestServerSession(t *testing.T, queueCap int) *ServerSession {
+	t.Helper()
+	sess := &ServerSession{
+		server:        &Server{maxRecvQueue: queueCap},
+		targetNetwork: "discard",
+		upstream:      newDiscardSink(),
+		recvQueue:     make(map[uint64][]byte),
+	}
+	sess.nextDeliverSeq.Store(1)
+	return sess
+}
+
+// dataRec builds a DATA-shaped record for the enqueue unit tests.
+func dataRec(seq uint64, n int) *Record {
+	return &Record{Cmd: CmdData, Seq: seq, Data: make([]byte, n)}
+}
+
+// TestEnqueueWatermarkAdvancesOnlyOnHoleFill pins the watermark rule: an
+// out-of-order record must NEVER advance the enqueue watermark past the hole
+// below it. Advancing would make the retransmission that fills the hole look
+// like an already-enqueued duplicate — it would be re-ACKed forever and never
+// delivered, stalling the session permanently.
+func TestEnqueueWatermarkAdvancesOnlyOnHoleFill(t *testing.T) {
+	sess := newDeliveryTestServerSession(t, 512)
+	path := PathID{Peer: netip.MustParseAddrPort("192.0.2.7:40000")}
+
+	// Out-of-order first: buffered, but the watermark stays at the hole (1).
+	if !sess.enqueueDataFromPath(dataRec(2, 8), path) {
+		t.Fatal("out-of-order record must be buffered")
+	}
+	if got := sess.nextDeliverSeq.Load(); got != 1 {
+		t.Fatalf("nextDeliverSeq after out-of-order seq=2 is %d, want 1 (the hole below is still open)", got)
+	}
+	// The hole-filling record advances across the whole contiguous run.
+	if !sess.enqueueDataFromPath(dataRec(1, 8), path) {
+		t.Fatal("hole-filling record must be accepted")
+	}
+	if got := sess.nextDeliverSeq.Load(); got != 3 {
+		t.Fatalf("nextDeliverSeq after filling seq=1 is %d, want 3 (1 and 2 are now contiguous)", got)
+	}
+	// And from here on, a retransmitted seq=1 classifies as a duplicate (the
+	// re-ACK branch), never as something to enqueue again.
+	if !sess.enqueueDataFromPath(dataRec(1, 8), path) {
+		t.Fatal("duplicate of a delivered/enqueued record must be accepted")
+	}
+	if got := sess.nextDeliverSeq.Load(); got != 3 {
+		t.Fatalf("duplicate moved the watermark to %d, want it untouched at 3", got)
+	}
+}
+
+// TestDeliveryBackpressureRetainsData pins the queue-capacity semantics: a
+// record beyond the next expected seq is refused when the queue is full (and
+// its packet number is rolled back by the caller), while the hole-filling
+// record always gets in — refusing it would stall the session forever with a
+// queue full of records sitting after the hole.
+func TestDeliveryBackpressureRetainsData(t *testing.T) {
+	sess := newDeliveryTestServerSession(t, 4)
+	path := PathID{Peer: netip.MustParseAddrPort("192.0.2.7:40000")}
+
+	// Fill the reorder buffer to capacity with records after the hole.
+	for seq := uint64(2); seq <= 5; seq++ {
+		if !sess.enqueueDataFromPath(dataRec(seq, 8), path) {
+			t.Fatalf("buffering seq=%d into an empty queue must succeed", seq)
+		}
+	}
+	if sess.enqueueDataFromPath(dataRec(6, 8), path) {
+		t.Fatal("a record beyond the hole must be refused when the queue is full")
+	}
+	// The hole-filler bypasses the cap: it completes the contiguous run, and
+	// the overshoot (one record) is retired by the immediate drain.
+	if !sess.enqueueDataFromPath(dataRec(1, 8), path) {
+		t.Fatal("the hole-filling record must always be accepted")
+	}
+	if len(sess.recvQueue) != 5 {
+		t.Fatalf("queue holds %d entries, want 5 (cap + the hole-filler)", len(sess.recvQueue))
+	}
+	// Delivery drains everything contiguously and advances the real progress.
+	if !sess.deliverPending() {
+		t.Fatal("deliverPending must report work after the hole filled")
+	}
+	if got := sess.ackedSeq.Load(); got != 5 {
+		t.Fatalf("ackedSeq = %d, want 5 (seq 1..5 delivered in order)", got)
+	}
+	if len(sess.recvQueue) != 0 {
+		t.Fatalf("queue holds %d entries after a full drain, want 0", len(sess.recvQueue))
+	}
+}
+
+// TestEarliestRetransmitDelayTracksDueTime pins the shared deadline arithmetic
+// the lazy retransmit loops arm their timers with.
+func TestEarliestRetransmitDelayTracksDueTime(t *testing.T) {
+	sent := time.Now().Add(-150 * time.Millisecond)
+	unacked := map[uint64]*unackedPkt{
+		1: {rto: 200 * time.Millisecond, sentTime: sent},
+		2: {rto: 600 * time.Millisecond, sentTime: sent.Add(100 * time.Millisecond)},
+	}
+	d, ok := earliestRetransmitDelay(unacked, 0)
+	if !ok {
+		t.Fatal("a non-empty outstanding map must produce a deadline")
+	}
+	// Record 1 is due in 50ms; record 2 in ~550ms. The earliest governs.
+	if d <= 0 || d > 100*time.Millisecond {
+		t.Fatalf("earliest delay = %v, want ~50ms (record 1 is due first)", d)
+	}
+	// After the earliest retires, the next record governs.
+	delete(unacked, 1)
+	d, ok = earliestRetransmitDelay(unacked, 0)
+	if !ok || d <= 400*time.Millisecond || d > 550*time.Millisecond {
+		t.Fatalf("after retiring record 1, delay = %v (ok=%v), want ~550ms from record 2", d, ok)
+	}
+	// An empty map reports no deadline at all: the loop must park, not spin.
+	delete(unacked, 2)
+	if _, ok := earliestRetransmitDelay(unacked, 0); ok {
+		t.Fatal("an empty outstanding map must report no deadline")
+	}
+}
+
+// TestClientNextDeadlineCoversIdle pins that the client's lazy loop stays
+// armed even with nothing outstanding: the idle timeout must still fire.
+func TestClientNextDeadlineCoversIdle(t *testing.T) {
+	s := newAckTestClientSession(t)
+
+	// With the helper's one outstanding record (rto = 1s, just sent), the
+	// record's deadline wins over the 75s idle deadline.
+	s.unackedMu.Lock()
+	pktRTO := s.unacked[1].rto
+	d, ok := earliestRetransmitDelay(s.unacked, 0)
+	s.unackedMu.Unlock()
+	if !ok || d <= 0 || d > pktRTO {
+		t.Fatalf("with an outstanding record, delay = %v (ok=%v), want ~%v", d, ok, pktRTO)
+	}
+
+	// With nothing outstanding, the idle deadline keeps the loop armed.
+	s.unacked = map[uint64]*unackedPkt{}
+	d, ok = s.nextDeadline()
+	if !ok {
+		t.Fatal("the idle deadline must keep the client loop armed")
+	}
+	if d < clientRecvTimeout-time.Minute || d > clientRecvTimeout {
+		t.Fatalf("idle-only deadline = %v, want ~%v", d, clientRecvTimeout)
+	}
+}
+
+// TestSlowTargetDoesNotStallOtherSessions is the head-of-line-blocking
+// regression: a backend that stops reading must stall only its own session's
+// delivery goroutine, never the server's single receive loop that every
+// session shares. The slow target is a net.Pipe nobody reads, so the session's
+// very first backend write blocks (until its own deadline) deterministically;
+// meanwhile a healthy session on the same server must round-trip promptly.
+func TestSlowTargetDoesNotStallOtherSessions(t *testing.T) {
+	echoBackend, stopEcho := tcpEchoServer(t)
+	defer stopEcho()
+
+	cEp, _, _ := newTestServer(t, ServerConfig{
+		TargetAddr:     "tcp://" + echoBackend,
+		AllowedTargets: []string{"tcp://slow"},
+		Passwords:      []string{"secret"},
+		Logger:         Nop{},
+	}, func(ctx context.Context, _ uint32, network, address string) (net.Conn, error) {
+		if address == "slow" {
+			// clientEnd is never read: the server's write into the pipe
+			// blocks until its own backend write deadline.
+			serverEnd, clientEnd := net.Pipe()
+			t.Cleanup(func() { _ = serverEnd.Close(); _ = clientEnd.Close() })
+			return serverEnd, nil
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	})
+	cli := newTestClient(t, ClientConfig{ServerAddr: "192.0.2.2", Passwords: []string{"secret"}, Logger: Nop{}}, cEp)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	slowConn, err := cli.DialTunnel(ctx, DialOptions{Target: "tcp://slow"})
+	if err != nil {
+		t.Fatalf("slow dial: %v", err)
+	}
+	defer slowConn.Close()
+	echoConn, err := cli.DialTunnel(ctx, DialOptions{})
+	if err != nil {
+		t.Fatalf("echo dial: %v", err)
+	}
+	defer echoConn.Close()
+
+	// Take the bait: one record is enough to park the slow session's
+	// delivery goroutine inside its backend write.
+	go func() { _ = writeAll(slowConn, make([]byte, 4096)) }()
+	time.Sleep(200 * time.Millisecond)
+
+	// The healthy session must not care.
+	_ = echoConn.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := echoConn.Write([]byte("ping")); err != nil {
+		t.Fatalf("echo write: %v", err)
+	}
+	got := make([]byte, 4)
+	if _, err := io.ReadFull(echoConn, got); err != nil {
+		t.Fatalf("echo round trip stalled behind the slow target: %v", err)
+	}
+	if string(got) != "ping" {
+		t.Fatalf("echo = %q, want ping", got)
 	}
 }

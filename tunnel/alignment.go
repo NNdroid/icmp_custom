@@ -48,12 +48,14 @@ var (
 	// clientSession (client.go)
 	_ = [int(unsafe.Alignof(clientSession{}.sendPacketNo)) - 8]byte{}
 	_ = [int(unsafe.Alignof(clientSession{}.sendSeq)) - 8]byte{}
-	_ = [int(unsafe.Alignof(clientSession{}.recvSeq)) - 8]byte{}
+	_ = [int(unsafe.Alignof(clientSession{}.nextDeliverSeq)) - 8]byte{}
+	_ = [int(unsafe.Alignof(clientSession{}.ackedSeq)) - 8]byte{}
 
 	// ServerSession (server.go)
 	_ = [int(unsafe.Alignof(ServerSession{}.sendPacketNo)) - 8]byte{}
 	_ = [int(unsafe.Alignof(ServerSession{}.sendSeq)) - 8]byte{}
-	_ = [int(unsafe.Alignof(ServerSession{}.recvSeq)) - 8]byte{}
+	_ = [int(unsafe.Alignof(ServerSession{}.nextDeliverSeq)) - 8]byte{}
+	_ = [int(unsafe.Alignof(ServerSession{}.ackedSeq)) - 8]byte{}
 
 	// Server health counters (server.go)
 	_ = [int(unsafe.Alignof(Server{}.decodeFailures)) - 8]byte{}

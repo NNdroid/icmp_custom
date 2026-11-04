@@ -34,7 +34,6 @@ const (
 	clientHandshakeBackoff     = 400 * time.Millisecond
 	clientRecvTimeout          = 75 * time.Second // > the server's 60s idle cleanup
 	clientMaxRetries           = 15
-	clientRetransmitInterval   = 50 * time.Millisecond
 	// Bound the time a stalled application reader may pin this client's single
 	// shared receive loop. The server retransmits unacknowledged data, so a
 	// delivery dropped here is self-healing.
@@ -471,8 +470,8 @@ func (c *Client) dispatch(raw []byte, rec *Record) {
 	if sess.frameKeys == nil {
 		return
 	}
-	// dispatch finishes before readLoop reuses the carrier buffer. handleData
-	// copies any out-of-order payload that must survive beyond this call.
+	// dispatch finishes before readLoop reuses the carrier buffer. enqueueData
+	// copies any payload that must survive beyond this call.
 	plain, err := OpenRecordAEADInto(rec.Data[:0], rec, sess.frameKeys.Recv)
 	if err != nil {
 		c.logDebug("[Client] [Session 0x%08X] record authentication rejected cmd=0x%02X: %v", sess.sid, rec.Cmd, err)
@@ -501,7 +500,7 @@ func (c *Client) dispatch(raw []byte, rec *Record) {
 	}
 	switch rec.Cmd {
 	case CmdData:
-		if !sess.handleData(rec) {
+		if !sess.enqueueData(rec) {
 			sess.replayFilter.Remove(rec.PacketNo)
 		}
 	case CmdAck:
@@ -593,16 +592,18 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 	}
 
 	sess := &clientSession{
-		client:     c,
-		sid:        sid,
-		conn:       conn,
-		frameKeys:  frameKeys,
-		granted:    granted,
-		recvQueue:  make(map[uint64][]byte),
-		unacked:    make(map[uint64]*unackedPkt),
-		lastActive: time.Now(),
-		lastSent:   time.Now(),
-		closeChan:  make(chan struct{}),
+		client:         c,
+		sid:            sid,
+		conn:           conn,
+		frameKeys:      frameKeys,
+		granted:        granted,
+		recvQueue:      make(map[uint64][]byte),
+		unacked:        make(map[uint64]*unackedPkt),
+		lastActive:     time.Now(),
+		lastSent:       time.Now(),
+		closeChan:      make(chan struct{}),
+		deliverWake:    make(chan struct{}, 1),
+		retransmitWake: make(chan struct{}, 1),
 		// The seed RTO (before any sample) and the maximum are policy; the lower
 		// clamp is deliberately rtoFloorNet, not the seed, so a fast path is
 		// allowed to converge to an RTO near its real round trip. Clamping at
@@ -610,7 +611,7 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 		rttEst: newRTTEstimator(200*time.Millisecond, rtoFloorNet, 10*time.Second),
 	}
 	sess.sendSeq.Store(1)
-	sess.recvSeq.Store(1)
+	sess.nextDeliverSeq.Store(1)
 	sess.unackedLow = 1
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	c.sessions.Store(sid, sess)
@@ -624,6 +625,7 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 		sess.close()
 	}()
 	go sess.retransmitLoop()
+	go sess.deliverLoop()
 	go sess.keepAliveLoop()
 	go sess.pollLoop()
 	go func() {
@@ -889,11 +891,26 @@ type clientSession struct {
 	// panicUnaligned). See alignment.go for the build-time proof.
 	sendPacketNo atomic.Uint64
 	sendSeq      atomic.Uint64
-	recvSeq      atomic.Uint64
-	replayFilter ReplayFilter
+	// nextDeliverSeq and ackedSeq split what used to be one recvSeq counter:
+	// nextDeliverSeq is the next in-order seq the receive loop will ENQUEUE
+	// (single writer: the client's shared receive loop); ackedSeq is the
+	// highest seq actually WRITTEN to the local application (single writer:
+	// the delivery goroutine). The cumulative ACK reports ackedSeq.
+	nextDeliverSeq atomic.Uint64
+	ackedSeq       atomic.Uint64
+	replayFilter   ReplayFilter
 
+	// recvQueue holds every authenticated, not-yet-written DATA payload keyed
+	// by seq: both in-order records awaiting the delivery goroutine and
+	// out-of-order records awaiting the hole below them. Capped by the
+	// client's maxRecvQueue.
 	recvQueue map[uint64][]byte
 	recvMu    sync.Mutex
+
+	// deliverWake nudges the delivery goroutine after a successful enqueue;
+	// retransmitWake tells the retransmit loop the outstanding set changed.
+	deliverWake    chan struct{}
+	retransmitWake chan struct{}
 
 	unacked     map[uint64]*unackedPkt
 	unackedLow  uint64 // lowest still-unacked seq; the unacked map is contiguous [unackedLow, max]
@@ -1079,6 +1096,9 @@ func (s *clientSession) sendData(payload []byte) error {
 	now := time.Now()
 	s.unacked[seq] = &unackedPkt{wire: encoded, firstSent: now, sentTime: now, rto: rto}
 	s.unackedMu.Unlock()
+	// The retransmit loop may be parked with its timer disarmed (nothing was
+	// outstanding): tell it the outstanding set changed so it re-arms.
+	nudge(s.retransmitWake)
 
 	// A carrier write failure during a route transition is equivalent to packet
 	// loss: the retained record is retried by retransmitLoop, so tearing the
@@ -1134,84 +1154,89 @@ func (s *clientSession) handleAck(ackSeq uint64) {
 	}
 }
 
+// retransmitLoop sleeps until the earliest deadline this session must react
+// to — the earliest outstanding record's retransmission, or the idle timeout,
+// whichever comes first — and sweeps then. It replaces the fixed 50ms ticker:
+// a quiet session wakes once per idle-deadline window instead of twenty times
+// per second, and a busy one wakes at the rate of actual retransmission
+// events.
 func (s *clientSession) retransmitLoop() {
-	ticker := time.NewTicker(clientRetransmitInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
 	for {
+		if s.isClosed() {
+			return
+		}
+		if d, ok := s.nextDeadline(); ok {
+			timer.Reset(d)
+		} else {
+			timer.Stop()
+		}
 		select {
 		case <-s.closeChan:
 			return
-		case <-ticker.C:
-			now := time.Now()
-			// The carrier may declare a floor above the estimator's RTO: a
-			// throttled path cannot answer faster than its own pace, and a
-			// blocked one must not be probed faster than its block timeout, or
-			// every retransmit is more fuel on the fire that is rate-limiting
-			// us. On a responsive path the floor tracks the observed RTT and a
-			// carrier that declares no floor at all returns zero, leaving the
-			// estimator's own RTO to govern. Re-read each tick because it moves
-			// with the classification; the capability itself was resolved once
-			// at construction (Client.cond), so this is a virtual call, not a
-			// per-tick interface assertion.
-			floor := conditionFloorOf(s.client.cond)
-			fed := s.client.mtuFed
-			// Collect the records due for retransmission under the lock, then
-			// send them OUTSIDE it: poke() takes pollMu and can block on the
-			// carrier, and holding unackedMu across that would stall every
-			// sender parked on the send window.
-			var toSend []*unackedPkt
-			abandon := false
-			s.unackedMu.Lock()
-			for seq, pkt := range s.unacked {
-				wait := pkt.rto
-				if wait < floor {
-					wait = floor
-				}
-				if now.Sub(pkt.sentTime) < wait {
-					continue
-				}
-				// Feed the timeout as MTU evidence now, not only on abandon. By
-				// the time the retries are exhausted it is ~76s out at the RTO
-				// floor — an undersized budget would have spent all of that
-				// overshooting a path it had already been told was narrow. The
-				// carrier's classifier suppresses this while throttled, so a
-				// rate-limited path cannot be mistaken for a narrow one.
-				if fed != nil {
-					fed.RecordLost(len(pkt.wire))
-				}
-				pkt.retries++
-				if pkt.retries > clientMaxRetries {
-					s.client.logWarn("[Client] [Session 0x%08X] Seq %d abandoned after %d retries", s.sid, seq, pkt.retries)
-					delete(s.unacked, seq)
-					abandon = true
-					break
-				}
-				pkt.sentTime = now
-				// Cap at the estimator's own maximum, matching the server's
-				// retransmit loop, instead of a second literal that could drift
-				// from the policy the estimator was built with.
-				pkt.rto = minDuration(pkt.rto*3/2, s.rttEst.maxRTT)
-				toSend = append(toSend, pkt)
-			}
-			s.unackedMu.Unlock()
-			if abandon {
-				s.closeWithReason("max retransmits exceeded")
-				return
-			}
-			for _, pkt := range toSend {
-				_ = s.poke(pkt.wire)
-			}
-
-			s.mu.Lock()
-			idle := now.Sub(s.lastActive)
-			s.mu.Unlock()
-			if idle > clientRecvTimeout {
-				s.client.logWarn("[Client] [Session 0x%08X] idle timeout (%v)", s.sid, idle)
-				s.closeWithReason("idle timeout")
-				return
+		case <-s.retransmitWake:
+			// A record was added: recompute the deadline.
+		case <-timer.C:
+			if !s.sweepRetransmissions() {
+				return // a record exhausted its retries; the session is closing
 			}
 		}
 	}
+}
+
+// nextDeadline is how long the retransmit loop may sleep: the earlier of the
+// earliest outstanding record's retransmission and the idle timeout. The idle
+// deadline always exists, so the timer is armed even for a session with
+// nothing outstanding.
+func (s *clientSession) nextDeadline() (time.Duration, bool) {
+	s.mu.Lock()
+	best := time.Until(s.lastActive.Add(clientRecvTimeout))
+	s.mu.Unlock()
+	// The outstanding map is mutated by sendData and handleAck: read it under
+	// its own mutex.
+	s.unackedMu.Lock()
+	if d, ok := earliestRetransmitDelay(s.unacked, conditionFloorOf(s.client.cond)); ok && d < best {
+		best = d
+	}
+	s.unackedMu.Unlock()
+	if best < 0 {
+		best = 0
+	}
+	return best, true
+}
+
+// sweepRetransmissions retransmits every record whose effective timeout has
+// elapsed and closes the session when one exhausts its retries (or when the
+// session has seen no authenticated traffic for clientRecvTimeout). It
+// reports false when the session must stop sweeping.
+func (s *clientSession) sweepRetransmissions() bool {
+	sweep := &retransmitSweep{
+		mu:         &s.unackedMu,
+		floor:      conditionFloorOf(s.client.cond),
+		fed:        s.client.mtuFed,
+		unacked:    s.unacked,
+		rttMax:     s.rttEst.maxRTT,
+		maxRetries: clientMaxRetries,
+		onAbandon: func(seq uint64) {
+			s.client.logWarn("[Client] [Session 0x%08X] Seq %d abandoned after max retries", s.sid, seq)
+			s.closeWithReason("max retransmits exceeded")
+		},
+		onRetransmit: func(pkt *unackedPkt) {
+			_ = s.poke(pkt.wire)
+		},
+	}
+	alive := sweep.run()
+
+	s.mu.Lock()
+	idle := time.Since(s.lastActive)
+	s.mu.Unlock()
+	if alive && idle > clientRecvTimeout {
+		s.client.logWarn("[Client] [Session 0x%08X] idle timeout (%v)", s.sid, idle)
+		s.closeWithReason("idle timeout")
+		return false
+	}
+	return alive
 }
 
 // keepAliveLoop emits a PING when the tunnel has been quiet. It only runs for
@@ -1314,76 +1339,127 @@ func (s *clientSession) maybePoll(stall time.Duration) {
 	s.sendControl(ping, s.poke)
 }
 
-// handleData delivers server data to the local application, buffering
-// out-of-order records and ACKing every record it delivers.
-func (s *clientSession) handleData(rec *Record) bool {
-	if rec.Seq == 0 {
+// enqueueData buffers one authenticated DATA record for delivery to the local
+// application.
+//
+// This is the shared receive loop's ENTIRE data job now: authentication,
+// replay filtering and this enqueue happen on the loop every session of this
+// client shares, and the actual application write runs on the session's
+// delivery goroutine (deliverLoop). A stalled application reader therefore
+// pins only its own session's delivery — bounded by the queue below — instead
+// of freezing every session on the client.
+//
+// It returns false only when the delivery queue is full: dispatch then rolls
+// the packet number back so the server's byte-identical retransmission is
+// accepted once the queue drains.
+func (s *clientSession) enqueueData(rec *Record) bool {
+	next := s.nextDeliverSeq.Load()
+	if rec.Seq < next {
+		// Already enqueued — possibly buffered but not yet written. The server
+		// is retransmitting because it lost our ACK, so re-ACK the progress
+		// that has actually been DELIVERED (ackedSeq, not the enqueue
+		// watermark) instead of dropping it.
+		if ack := s.ackedSeq.Load(); ack > 0 {
+			s.sendACK(ack)
+		}
 		return true
 	}
 
 	s.recvMu.Lock()
-	payload := rec.Data
-	expected := s.recvSeq.Load()
-	if rec.Seq != expected {
-		if rec.Seq < expected {
-			// Already delivered: the server is retransmitting because it lost
-			// our ACK, so re-ACK instead of dropping it.
-			ackSeq := expected - 1
-			s.recvMu.Unlock()
-			s.sendACK(ackSeq)
-			return true
-		}
-		if _, dup := s.recvQueue[rec.Seq]; dup {
-			s.recvMu.Unlock()
-			return true
-		}
-		if len(s.recvQueue) >= s.client.maxRecvQueue {
+	if _, dup := s.recvQueue[rec.Seq]; !dup {
+		// The queue-full rejection applies ONLY to a record beyond the next
+		// expected seq: it is optional reorder buffering, and refusing it is
+		// safe (the server retransmits). The hole-filling record — seq ==
+		// nextDeliverSeq — must always get in: it completes the contiguous
+		// run the delivery goroutine is waiting for, so refusing it while the
+		// queue holds only records AFTER the hole would stall the session
+		// forever. Accepting it overshoots the cap by exactly one record,
+		// which the drain immediately retires.
+		if rec.Seq > next && len(s.recvQueue) >= s.client.maxRecvQueue {
 			s.recvMu.Unlock()
 			return false
 		}
-		s.recvQueue[rec.Seq] = append([]byte(nil), payload...)
-		s.touch()
-		s.recvMu.Unlock()
-		return true
+		s.recvQueue[rec.Seq] = append([]byte(nil), rec.Data...)
+		// Only a HOLE-FILLING record (seq == next) may advance the enqueue
+		// watermark, and it advances across the contiguous run that just
+		// became complete. An out-of-order record must leave the watermark
+		// alone: the hole BELOW it is still open, and advancing past it would
+		// make the retransmission that fills that hole look like an
+		// already-enqueued duplicate — it would be re-ACKed and never
+		// delivered, stalling the session permanently.
+		if rec.Seq == next {
+			high := rec.Seq
+			for {
+				if _, ok := s.recvQueue[high+1]; !ok {
+					break
+				}
+				high++
+			}
+			s.nextDeliverSeq.Store(high + 1)
+		}
 	}
-	s.touch()
+	s.recvMu.Unlock()
 
-	// Collect the in-order contiguous run under the lock, then deliver it
-	// OUTSIDE the lock: s.conn is a synchronous net.Pipe whose write blocks
-	// until the application reads, and sendACK -> poke takes pollMu. Holding
-	// recvMu across either would stall this client's single shared receive
-	// loop (readLoop) and, with it, every other session.
-	type pending struct {
-		seq     uint64
-		payload []byte
+	s.touch()
+	nudge(s.deliverWake)
+	return true
+}
+
+// deliverLoop is the session's only application-connection writer.
+//
+// It drains the contiguous run of enqueued records starting at ackedSeq+1 and
+// advances the cumulative ACK with REAL delivery progress. Per-session
+// ordering is preserved by construction — one goroutine, sequence order.
+func (s *clientSession) deliverLoop() {
+	for {
+		if s.isClosed() {
+			return
+		}
+		if s.deliverPending() {
+			// Wrote something; there may be more already enqueued behind it.
+			continue
+		}
+		select {
+		case <-s.closeChan:
+			return
+		case <-s.deliverWake:
+		}
 	}
-	run := []pending{{seq: expected, payload: payload}}
-	next := expected + 1
+}
+
+// deliverPending drains and writes one contiguous run. It reports whether
+// anything was written; an application write failure closes the session and
+// abandons the rest of the run — no ACK is sent for any of it, so the server
+// retransmits into a closing session and nothing is silently acknowledged.
+func (s *clientSession) deliverPending() bool {
+	s.recvMu.Lock()
+	var run [][]byte
+	next := s.ackedSeq.Load() + 1
 	for {
 		raw, ok := s.recvQueue[next]
 		if !ok {
 			break
 		}
 		delete(s.recvQueue, next)
-		run = append(run, pending{seq: next, payload: raw})
+		run = append(run, raw)
 		next++
 	}
-	delivered := uint64(len(run))
-	ackSeq := expected + delivered - 1
-	s.recvSeq.Store(expected + delivered)
 	s.recvMu.Unlock()
-
-	// Bound the application write so a stalled reader cannot pin the receive
-	// loop forever. The server retransmits unacknowledged data, so a delivery
-	// dropped here is self-healing.
+	if len(run) == 0 {
+		return false
+	}
+	// Bound the application write so a stalled reader cannot pin this
+	// goroutine forever. The server retransmits unacknowledged data, so a
+	// delivery dropped here is self-healing.
 	_ = s.conn.SetWriteDeadline(time.Now().Add(clientAppWriteTimeout))
-	for _, p := range run {
-		if err := writeAll(s.conn, p.payload); err != nil {
+	for _, payload := range run {
+		if err := writeAll(s.conn, payload); err != nil {
 			s.closeWithReason("application write failed")
 			return true
 		}
 	}
-	s.sendACK(ackSeq)
+	s.ackedSeq.Store(next - 1)
+	s.sendACK(next - 1)
 	return true
 }
 
@@ -1415,11 +1491,10 @@ func (s *clientSession) sendControl(r *Record, send func([]byte) error) bool {
 	return true
 }
 
+// currentAck is the cumulative ACK this end advertises: the highest seq
+// actually written to the local application, not the enqueue watermark.
 func (s *clientSession) currentAck() uint64 {
-	if next := s.recvSeq.Load(); next > 0 {
-		return next - 1
-	}
-	return 0
+	return s.ackedSeq.Load()
 }
 
 func (s *clientSession) reackDuplicateData() {
