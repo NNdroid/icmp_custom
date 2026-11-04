@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"strings"
@@ -167,9 +168,15 @@ type Client struct {
 
 	// mtuFed and authFed are the carrier's optional feedback capabilities,
 	// resolved once (the carrier is immutable). Both are nil for an ordinary
-	// carrier and every use is nil-checked.
+	// carrier and every use is nil-checked. poller and cond are the same story
+	// for the request-driven send path and the retransmit floor: the per-record
+	// poke path must not re-assert an interface per packet.
 	mtuFed  MTUFeedback
 	authFed AuthenticatedFeedback
+	poller  Poller
+	cond    CarrierCondition
+
+	maxRecvQueue int
 
 	sessions sync.Map // sessionID -> *clientSession
 
@@ -234,6 +241,9 @@ func NewClientWithTransport(cfg ClientConfig, tr Transport) (*Client, error) {
 		maxPayload:    MaxPayloadFor(maxReceiveSizeOf(tr)),
 		mtuFed:        mtuFeedbackOf(tr),
 		authFed:       authenticatedFeedbackOf(tr),
+		poller:        pollerOf(tr),
+		cond:          carrierConditionOf(tr),
+		maxRecvQueue:  512,
 		pendingAcks:   make(map[[ClientNonceSize]byte]*pendingHandshake),
 		events:        newEventBus[ClientEvent](128),
 		closeChan:     make(chan struct{}),
@@ -405,6 +415,14 @@ func (c *Client) readLoop() {
 		if err != nil {
 			if atomic.LoadInt32(&c.closed) == 1 || isClosedTransportErr(err) {
 				return
+			}
+			// A record larger than the receive buffer is hostile or foreign
+			// traffic the carrier refused to deliver. That is junk on the
+			// wire, not a reason to stop listening: a single unauthenticated
+			// oversized datagram must never end the only receive loop this
+			// client has.
+			if errors.Is(err, ErrRecordTooLarge) {
+				continue
 			}
 			c.logWarn("[Client] carrier read error: %v", err)
 			return
@@ -771,7 +789,7 @@ func (c *Client) handshakeWithPSK(ctx context.Context, target, psk string) (uint
 // request-driven carrier the SYN is a request and the ACK comes back as its
 // reply; on a datagram carrier it is a plain write.
 func (c *Client) sendHandshakeRecord(wire []byte) error {
-	if p := pollerOf(c.tr); p != nil {
+	if p := c.poller; p != nil {
 		_, err := p.Poke(wire, c.serverAddr)
 		return err
 	}
@@ -956,7 +974,7 @@ func (s *clientSession) poke(wire []byte) error {
 	}
 	s.pollMu.Unlock()
 
-	p := pollerOf(s.client.tr)
+	p := s.client.poller
 	if p == nil {
 		return s.client.tr.WriteRecord(wire, s.client.serverAddr)
 	}
@@ -1013,6 +1031,13 @@ func (s *clientSession) localToRemote() {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
+			if errors.Is(err, io.EOF) {
+				// A clean local EOF is the application closing its end, not a
+				// failure: name it as such so TunnelSession.Err() reports the
+				// real cause instead of an invented read error.
+				s.closeWithReason("local conn closed")
+				return
+			}
 			s.closeWithReason("local conn read failed")
 			return
 		}
@@ -1066,6 +1091,19 @@ func (s *clientSession) sendData(payload []byte) error {
 
 func (s *clientSession) handleAck(ackSeq uint64) {
 	s.unackedMu.Lock()
+	if len(s.unacked) == 0 {
+		s.unackedMu.Unlock()
+		return
+	}
+	// The claimed range is clamped to what this end has actually sent. The
+	// field is authenticated but the peer is not trusted to be sane: a hostile
+	// or buggy Ack near 2^64 would otherwise drive the retirement loop below
+	// essentially forever while holding unackedMu — on this client's single
+	// shared receive loop, freezing every session at once — and wrap
+	// unackedLow to zero.
+	if max := s.sendSeq.Load() - 1; ackSeq > max {
+		ackSeq = max
+	}
 	// Sample RTT from the exact record only when it was never retransmitted.
 	if pkt, ok := s.unacked[ackSeq]; ok && pkt.retries == 0 {
 		s.rttEst.Sample(time.Since(pkt.firstSent))
@@ -1112,8 +1150,10 @@ func (s *clientSession) retransmitLoop() {
 			// us. On a responsive path the floor tracks the observed RTT and a
 			// carrier that declares no floor at all returns zero, leaving the
 			// estimator's own RTO to govern. Re-read each tick because it moves
-			// with the classification.
-			floor := rtoFloorOf(s.client.tr)
+			// with the classification; the capability itself was resolved once
+			// at construction (Client.cond), so this is a virtual call, not a
+			// per-tick interface assertion.
+			floor := conditionFloorOf(s.client.cond)
 			fed := s.client.mtuFed
 			// Collect the records due for retransmission under the lock, then
 			// send them OUTSIDE it: poke() takes pollMu and can block on the
@@ -1147,7 +1187,10 @@ func (s *clientSession) retransmitLoop() {
 					break
 				}
 				pkt.sentTime = now
-				pkt.rto = minDuration(pkt.rto*3/2, 10*time.Second)
+				// Cap at the estimator's own maximum, matching the server's
+				// retransmit loop, instead of a second literal that could drift
+				// from the policy the estimator was built with.
+				pkt.rto = minDuration(pkt.rto*3/2, s.rttEst.maxRTT)
 				toSend = append(toSend, pkt)
 			}
 			s.unackedMu.Unlock()
@@ -1174,7 +1217,7 @@ func (s *clientSession) retransmitLoop() {
 // keepAliveLoop emits a PING when the tunnel has been quiet. It only runs for
 // datagram carriers: on a request-driven carrier the poll loop subsumes it.
 func (s *clientSession) keepAliveLoop() {
-	if pollerOf(s.client.tr) != nil {
+	if s.client.poller != nil {
 		return
 	}
 	ticker := time.NewTicker(5 * time.Second)
@@ -1208,7 +1251,7 @@ func (s *clientSession) keepAliveLoop() {
 // carrier's pace). The poll spacing adapts: pace while active, idle_poll_ms
 // when quiet, keepalive_ms when deeply idle.
 func (s *clientSession) pollLoop() {
-	if pollerOf(s.client.tr) == nil {
+	if s.client.poller == nil {
 		return
 	}
 	cfg := s.client.cfg
@@ -1294,7 +1337,7 @@ func (s *clientSession) handleData(rec *Record) bool {
 			s.recvMu.Unlock()
 			return true
 		}
-		if len(s.recvQueue) >= 512 {
+		if len(s.recvQueue) >= s.client.maxRecvQueue {
 			s.recvMu.Unlock()
 			return false
 		}

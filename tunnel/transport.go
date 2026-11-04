@@ -286,9 +286,17 @@ const rtoFloorNet = 10 * time.Millisecond
 // floor keep exactly the previous behaviour.
 //
 // Callers on a hot path should cache the CarrierCondition instead of
-// re-asserting per packet.
+// re-asserting per packet — see conditionFloorOf, which takes the already
+// resolved capability.
 func rtoFloorOf(tr Transport) time.Duration {
-	if c := carrierConditionOf(tr); c != nil {
+	return conditionFloorOf(carrierConditionOf(tr))
+}
+
+// conditionFloorOf is rtoFloorOf for a CarrierCondition resolved once at
+// construction (Server.cond / Client.poller-style caching): the retransmit
+// loops call it every tick and must not re-assert the interface each time.
+func conditionFloorOf(c CarrierCondition) time.Duration {
+	if c != nil {
 		if floor := c.RTOFloor(); floor > 0 {
 			return floor
 		}

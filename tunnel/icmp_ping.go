@@ -80,6 +80,13 @@ type pingICMP struct {
 	localName  string
 	remoteName string
 
+	// recvCeiling is the largest complete record this end accepts from the
+	// peer (the configured ceiling). The pump drops any Echo payload above it
+	// before it can occupy a queue slot: such a payload can never be a valid
+	// record, and letting it through would let one unauthenticated oversized
+	// ICMP datagram wedge the session's single receive loop.
+	recvCeiling int
+
 	// sockPort resolves the bound "port" (= Echo Identifier) of a socket fd.
 	// Injected because the real implementation needs getsockname(2); tests
 	// supply a fake. A port of 0 means "not assigned yet".
@@ -220,6 +227,17 @@ func (p *pingICMP) pump(s *pingSocket) {
 			continue
 		}
 		if echo.PathBudget == 0 && len(echo.Payload) == 0 {
+			continue
+		}
+		// Drop a payload above the receive ceiling before it can occupy a
+		// queue slot. It can never be a valid record (the session's Parse
+		// rejects it), and an Echo reaching this socket is unauthenticated:
+		// without this gate, one unauthenticated oversized datagram would
+		// drain a queue slot per packet and, worse, is the only input an
+		// attacker has that can wedge the receive path. A non-positive
+		// ceiling (a carrier built without a profile) means no limit, the
+		// package's convention for "unset".
+		if p.recvCeiling > 0 && len(echo.Payload) > p.recvCeiling {
 			continue
 		}
 		if peer := netipAddrOf(from); peer.IsValid() {

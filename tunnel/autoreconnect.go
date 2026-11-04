@@ -87,8 +87,11 @@ func (a *AutoReconnect) ensure() (net.Conn, error) {
 	a.mu.Unlock()
 
 	// Back off before redialing so a server that is down or rejecting us is
-	// not hammered by a tight Read/Write loop. Only dialMu is held during the
-	// wait, so other operations fail fast instead of piling up behind it.
+	// not hammered by a tight Read/Write loop. dialMu is held across the whole
+	// backoff + dial: concurrent Read/Write callers therefore BLOCK behind it
+	// (backpressure) rather than each spawning their own dial. The block can
+	// last the full backoff plus handshake budget, so embedders that need a
+	// bound on it should wrap the deadline into the conn they hand out.
 	if isReconnect && backoff > 0 {
 		select {
 		case <-time.After(backoff):

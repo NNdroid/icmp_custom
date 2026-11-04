@@ -50,9 +50,10 @@ func newPlatformICMPTransport(cfg *icmpConfig) (platformICMP, error) {
 	}
 
 	p := &pingICMP{
-		in:       make(chan inboundEcho, pingPumpQueue),
-		closed:   make(chan struct{}),
-		sockPort: unixSockPort,
+		in:          make(chan inboundEcho, pingPumpQueue),
+		closed:      make(chan struct{}),
+		recvCeiling: cfg.core.receiveCeiling(),
+		sockPort:    unixSockPort,
 	}
 	p.localName = "ping-socket/" + cfg.family.String()
 	p.remoteName = cfg.peer.String()

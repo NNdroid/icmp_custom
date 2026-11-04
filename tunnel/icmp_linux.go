@@ -101,6 +101,13 @@ type rawICMP struct {
 
 	localName  string
 	remoteName string
+
+	// recvCeiling is the largest complete record this end accepts from the
+	// peer (the configured ceiling). The pump drops any Echo payload above it
+	// before it can occupy a queue slot: such a payload can never be a valid
+	// record, and letting it through would let one unauthenticated oversized
+	// ICMP datagram wedge the session's single receive loop.
+	recvCeiling int
 }
 
 var _ platformICMP = (*rawICMP)(nil)
@@ -112,8 +119,9 @@ func newPlatformICMPTransport(cfg *icmpConfig) (platformICMP, error) {
 	}
 
 	r := &rawICMP{
-		in:     make(chan inboundEcho, rawPumpQueue),
-		closed: make(chan struct{}),
+		in:          make(chan inboundEcho, rawPumpQueue),
+		closed:      make(chan struct{}),
+		recvCeiling: cfg.core.receiveCeiling(),
 	}
 	r.localName = "raw-icmp/" + cfg.family.String()
 	r.remoteName = "any"
@@ -308,6 +316,17 @@ func (r *rawICMP) pump(s *rawSocket) {
 			continue
 		}
 		if echo.PathBudget == 0 && len(echo.Payload) == 0 {
+			continue
+		}
+		// Drop a payload above the receive ceiling before it can occupy a
+		// queue slot. It can never be a valid record (the session's Parse
+		// rejects it), and the raw socket accepts Echo traffic from anyone:
+		// without this gate, one unauthenticated oversized datagram would
+		// drain a queue slot per packet and, worse, is the only input an
+		// attacker has that can wedge the receive path. A non-positive
+		// ceiling (a carrier built without a profile) means no limit, the
+		// package's convention for "unset".
+		if r.recvCeiling > 0 && len(echo.Payload) > r.recvCeiling {
 			continue
 		}
 		// The source address is the only place the peer is knowable: IPv6 raw

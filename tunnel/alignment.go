@@ -62,6 +62,7 @@ var (
 	_ = [int(unsafe.Alignof(Server{}.queueFullDrops)) - 8]byte{}
 	_ = [int(unsafe.Alignof(Server{}.sendFailures)) - 8]byte{}
 	_ = [int(unsafe.Alignof(Server{}.addrChanges)) - 8]byte{}
+	_ = [int(unsafe.Alignof(Server{}.unknownSessionDrops)) - 8]byte{}
 
 	// eventBus (events.go)
 	_ = [int(unsafe.Alignof(eventBus[SessionEvent]{}.dropped)) - 8]byte{}

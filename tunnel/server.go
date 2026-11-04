@@ -136,9 +136,11 @@ type Server struct {
 	// mtuFed and authFed are the carrier's optional feedback capabilities,
 	// resolved once at construction (the carrier is immutable) so the per-record
 	// paths never re-assert an interface. Both are nil for an ordinary carrier,
-	// which is nearly all of them, and every use is nil-checked.
+	// which is nearly all of them, and every use is nil-checked. cond is the
+	// same story for the retransmit floor.
 	mtuFed  MTUFeedback
 	authFed AuthenticatedFeedback
+	cond    CarrierCondition
 
 	privKey    [32]byte
 	hasPrivKey bool
@@ -168,12 +170,13 @@ type Server struct {
 	// aligns that type even on 32-bit platforms, where an unaligned uint64
 	// makes every sync/atomic op panic (runtime panicUnaligned). See
 	// alignment.go for the build-time proof.
-	decodeFailures atomic.Uint64 // undecodable records (junk, scans, mismatched peers)
-	macFailures    atomic.Uint64 // v2 authentication failures
-	replayDrops    atomic.Uint64 // authenticated records rejected by the replay window
-	queueFullDrops atomic.Uint64 // reorder-buffer overflows
-	sendFailures   atomic.Uint64 // carrier write failures
-	addrChanges    atomic.Uint64 // times a session's observed peer address changed
+	decodeFailures      atomic.Uint64 // undecodable records (junk, scans, mismatched peers)
+	macFailures         atomic.Uint64 // v2 authentication failures
+	replayDrops         atomic.Uint64 // authenticated records rejected by the replay window
+	queueFullDrops      atomic.Uint64 // reorder-buffer overflows
+	sendFailures        atomic.Uint64 // carrier write failures
+	addrChanges         atomic.Uint64 // times a session's observed peer address changed
+	unknownSessionDrops atomic.Uint64 // structurally valid records for a SessionID this server never established
 }
 
 // NewServerWithTransport builds a server on an injected carrier. It is the
@@ -216,6 +219,7 @@ func NewServerWithTransport(cfg ServerConfig, tr Transport, dial TargetDialer) (
 		maxPayload:    MaxPayloadFor(maxReceiveSizeOf(tr)),
 		mtuFed:        mtuFeedbackOf(tr),
 		authFed:       authenticatedFeedbackOf(tr),
+		cond:          carrierConditionOf(tr),
 		closeChan:     make(chan struct{}),
 		events:        newEventBus[SessionEvent](256),
 		synCache:      newSynCache(),
@@ -303,6 +307,14 @@ func (s *Server) readLoop() {
 			if atomic.LoadInt32(&s.closed) == 1 || isClosedTransportErr(err) {
 				return
 			}
+			// A record larger than the receive buffer is hostile or foreign
+			// traffic the carrier refused to deliver. That is junk on the
+			// wire, not a reason to stop listening: a single unauthenticated
+			// oversized datagram must never end the only receive loop this
+			// server has.
+			if errors.Is(err, ErrRecordTooLarge) {
+				continue
+			}
 			s.logWarn("[Server] carrier read error: %v", err)
 			return
 		}
@@ -313,7 +325,7 @@ func (s *Server) readLoop() {
 			}
 			continue
 		}
-		if s.loggerLevel() <= LogLevelDebug {
+		if levelOf(s.logger) <= LogLevelDebug {
 			s.logDebug("[Recv] peer=%s ident=%d seq=%d cmd=0x%02X sid=0x%08X len=%d",
 				path.Peer, path.Ident, path.Seq, rec.Cmd, rec.SessionID, n)
 		}
@@ -349,6 +361,15 @@ func (s *Server) readLoop() {
 		// authoritative session key; the carrier's Ident is a cheap prefilter.
 		if v, ok := s.sessions.Load(rec.SessionID); ok && v != nil {
 			v.(*ServerSession).processIncomingRecord(&rec, path)
+		} else {
+			// Structurally valid but addressed to a session this server never
+			// established. Counted (throttled log): a flood of these is the
+			// signature of a scanner guessing SessionIDs, and without the
+			// counter that traffic is invisible to Stats and SIEM alike.
+			if c := s.unknownSessionDrops.Add(1); c == 1 || c%1000 == 0 {
+				s.logWarn("[Server] record for unknown session 0x%08X cmd=0x%02X from %s (count=%d)",
+					rec.SessionID, rec.Cmd, path.Peer, c)
+			}
 		}
 	}
 }
@@ -409,9 +430,19 @@ func (s *Server) handleHandshake(path PathID, rec *Record, matchedPSK string) {
 	// legitimate case (client lost our ACK and retransmits the SYN) and kills
 	// the replay case (a captive SYN within the +-300s window can no longer
 	// force a fresh target connection per replay).
-	cached, owner := s.synCache.Acquire(cacheKey, time.Now())
+	cached, owner, firstSrc := s.synCache.Acquire(cacheKey, time.Now(), path.Peer.Addr())
 	if cached != nil {
-		s.logInfo("[Handshake] replayed SYN from %s: resending cached ACK", path.Peer)
+		if firstSrc.IsValid() && firstSrc != path.Peer.Addr() {
+			// The SYN itself is valid but arrived from an address the original
+			// handshake never used. Most often a client that migrated mid-
+			// handshake — but this is also the replay shape an off-path third
+			// party can produce from a captured SYN, so make it loud without
+			// refusing it.
+			s.logWarn("[Handshake] replayed SYN from %s: cached ACK was first issued to %s, resending anyway",
+				path.Peer, firstSrc)
+		} else {
+			s.logInfo("[Handshake] replayed SYN from %s: resending cached ACK", path.Peer)
+		}
 		_ = s.tr.ReplyRecord(cached, path)
 		return
 	}
@@ -610,16 +641,21 @@ func (s *Server) allocateSessionID() (uint32, error) {
 	}
 }
 
-// Close stops the server: it closes the carrier, tears down every session and
+// Close stops the server: it tears down every session, closes the carrier and
 // stops the event bus. Safe to call more than once.
+//
+// The sessions are closed BEFORE the carrier on purpose: each session's Close
+// emits a best-effort FIN, and a FIN sent after tr.Close() would only become a
+// sendFailures counter — leaving every client to discover the shutdown through
+// its own idle timeout instead.
 func (s *Server) Close() {
 	if atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
 		close(s.closeChan)
-		_ = s.tr.Close()
 		s.sessions.Range(func(_, value any) bool {
 			value.(*ServerSession).Close()
 			return true
 		})
+		_ = s.tr.Close()
 		s.events.close()
 	}
 }
@@ -644,14 +680,15 @@ func (s *Server) cleanupLoop() {
 				}
 				return true
 			})
-			s.logDebug("[Stats] sessions=%d authFail=%d replayDrop=%d queueFull=%d decodeFail=%d sendFail=%d addrChange=%d",
+			s.logDebug("[Stats] sessions=%d authFail=%d replayDrop=%d queueFull=%d decodeFail=%d sendFail=%d addrChange=%d unknownSession=%d",
 				s.sessionCount(),
 				s.macFailures.Load(),
 				s.replayDrops.Load(),
 				s.queueFullDrops.Load(),
 				s.decodeFailures.Load(),
 				s.sendFailures.Load(),
-				s.addrChanges.Load())
+				s.addrChanges.Load(),
+				s.unknownSessionDrops.Load())
 		}
 	}
 }
@@ -665,25 +702,27 @@ func (s *Server) sessionCount() int {
 // ServerStats is a point-in-time snapshot of the server's health counters.
 // All counters are cumulative since start; Sessions is a live gauge.
 type ServerStats struct {
-	Sessions       int    // live sessions (gauge)
-	AuthFailures   uint64 // v2 authentication rejections (forgery/replay diagnostics)
-	DecodeFailures uint64 // undecodable records (junk, scans, mismatched peers)
-	ReplayDrops    uint64 // authenticated records rejected by the replay window
-	QueueFullDrops uint64 // reorder-buffer overflows (client behind or loss)
-	SendFailures   uint64 // carrier write failures
-	AddressChanges uint64 // observed peer-address changes (NAT rebinding/migration)
+	Sessions        int    // live sessions (gauge)
+	AuthFailures    uint64 // v2 authentication rejections (forgery/replay diagnostics)
+	DecodeFailures  uint64 // undecodable records (junk, scans, mismatched peers)
+	ReplayDrops     uint64 // authenticated records rejected by the replay window
+	QueueFullDrops  uint64 // reorder-buffer overflows (client behind or loss)
+	SendFailures    uint64 // carrier write failures
+	AddressChanges  uint64 // observed peer-address changes (NAT rebinding/migration)
+	UnknownSessions uint64 // records for a SessionID this server never established
 }
 
 // Stats returns a snapshot of the counters the server also logs periodically.
 func (s *Server) Stats() ServerStats {
 	return ServerStats{
-		Sessions:       s.sessionCount(),
-		AuthFailures:   s.macFailures.Load(),
-		DecodeFailures: s.decodeFailures.Load(),
-		ReplayDrops:    s.replayDrops.Load(),
-		QueueFullDrops: s.queueFullDrops.Load(),
-		SendFailures:   s.sendFailures.Load(),
-		AddressChanges: s.addrChanges.Load(),
+		Sessions:        s.sessionCount(),
+		AuthFailures:    s.macFailures.Load(),
+		DecodeFailures:  s.decodeFailures.Load(),
+		ReplayDrops:     s.replayDrops.Load(),
+		QueueFullDrops:  s.queueFullDrops.Load(),
+		SendFailures:    s.sendFailures.Load(),
+		AddressChanges:  s.addrChanges.Load(),
+		UnknownSessions: s.unknownSessionDrops.Load(),
 	}
 }
 
@@ -691,16 +730,6 @@ func (s *Server) logDebug(format string, v ...any) { s.logger.Debugf(format, v..
 func (s *Server) logInfo(format string, v ...any)  { s.logger.Infof(format, v...) }
 func (s *Server) logWarn(format string, v ...any)  { s.logger.Warnf(format, v...) }
 func (s *Server) logError(format string, v ...any) { s.logger.Errorf(format, v...) }
-
-// loggerLevel reports the configured verbosity for debug-gating hot paths. An
-// injected Logger always receives everything (level 0); the filter lives
-// inside resolveLogger for the default std logger.
-func (s *Server) loggerLevel() int {
-	if s.cfg.Logger != nil {
-		return LogLevelDebug
-	}
-	return LogLevel(s.cfg.LogLevel)
-}
 
 // SessionEventKind enumerates the lifecycle transitions reported through
 // Server.SetEventHandler.
@@ -886,6 +915,12 @@ type unackedPkt struct {
 type synRecord struct {
 	ackFrame  []byte
 	createdAt time.Time
+	// src is the source address of the SYN that created the entry. A replay
+	// from a different address cannot be distinguished from a legitimate
+	// client that migrated before its first ACK arrived, so the cached ACK is
+	// still resent — but the mismatch is loud, because this is the one
+	// response an unauthenticated third party can elicit from the server.
+	src netip.Addr
 }
 
 // synCacheKey maps a client nonce plus an opaque PSK-derived identifier to its
@@ -920,20 +955,21 @@ func newSynCache() *synCache {
 
 // Acquire atomically returns a completed cached ACK or reserves the key for
 // exactly one handshake goroutine. A nil ACK with owner=false means another
-// goroutine currently owns the same in-progress handshake.
-func (c *synCache) Acquire(key synCacheKey, now time.Time) (ack []byte, owner bool) {
+// goroutine currently owns the same in-progress handshake. firstSrc is the
+// address the cached handshake was first seen from (zero for a fresh entry).
+func (c *synCache) Acquire(key synCacheKey, now time.Time, src netip.Addr) (ack []byte, owner bool, firstSrc netip.Addr) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if rec, ok := c.entries[key]; ok {
 		if now.Sub(rec.createdAt) <= synCacheTTL {
-			return rec.ackFrame, false
+			return rec.ackFrame, false, rec.src
 		}
 		delete(c.entries, key)
 	}
 	c.makeSpaceLocked(now)
-	c.entries[key] = synRecord{createdAt: now}
+	c.entries[key] = synRecord{createdAt: now, src: src}
 	c.fifo = append(c.fifo, synFIFOEntry{key: key, createdAt: now})
-	return nil, true
+	return nil, true, netip.Addr{}
 }
 
 // Complete publishes the immutable ACK for a key reserved by Acquire.
@@ -1436,6 +1472,15 @@ func (sess *ServerSession) handleAck(ackSeq uint64) {
 	// ACKs are cumulative: "everything up to ackSeq has been delivered". This
 	// matches the ACKs this end emits and keeps a lost ACK from leaving a
 	// record stuck in the retransmit queue — any later ACK covers it.
+	//
+	// The claimed range is clamped to what this end has actually sent. The
+	// field is authenticated but the peer is not trusted to be sane: a hostile
+	// or buggy Ack near 2^64 would otherwise drive the retirement loop below
+	// essentially forever while holding unackedMu — on the single receive
+	// loop, freezing the whole server — and wrap unackedLow to zero.
+	if max := sess.sendSeq.Load() - 1; ackSeq > max {
+		ackSeq = max
+	}
 	if pkt, ok := sess.unacked[ackSeq]; ok && pkt.retries == 0 {
 		// Karn's rule: only sample RTT from a record that was never
 		// retransmitted; the RTT of a retransmitted one is not trustworthy.
@@ -1755,8 +1800,10 @@ func (sess *ServerSession) retransmitLoop() {
 			// rate-limited. A responsive path tracks the observed RTT, and a
 			// carrier that declares no floor returns zero and lets the estimator
 			// govern. Re-read it each tick because it moves with the carrier's
-			// classification.
-			floor := rtoFloorOf(sess.server.tr)
+			// classification; the capability itself was resolved once at
+			// construction (Server.cond), so this is a virtual call, not a
+			// per-tick interface assertion.
+			floor := conditionFloorOf(sess.server.cond)
 			fed := sess.server.mtuFed
 			// Collect the records due for retransmission under the lock, then
 			// send them OUTSIDE it: sendToSession can block on the carrier, and

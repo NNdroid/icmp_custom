@@ -208,7 +208,7 @@ const serverTemplate = `{
 
   "icmp": {
     "max_payload": 1200,     // start and hard ceiling of the MTU search
-    "mtu_mode": "probe",     // probe | auto (in-band only) | fixed
+    "mtu_mode": "auto",      // auto (in-band adaptation) | fixed
     "mtu_min": 548,          // never step below (IPv4 reassembly floor)
     "mtu_step": 100,         // upward step, halved near the ceiling
     "pace_ms": 20,           // spaces outbound packets; both ends need it
@@ -249,7 +249,7 @@ const clientTemplate = `{
 
   "icmp": {
     "max_payload": 1200,
-    "mtu_mode": "probe",
+    "mtu_mode": "auto",
     "mtu_min": 548,
     "mtu_step": 100,
     "pace_ms": 20,

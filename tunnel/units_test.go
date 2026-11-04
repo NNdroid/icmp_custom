@@ -305,7 +305,7 @@ func TestSynCacheAbortReleasesAReservation(t *testing.T) {
 	key := makeSynCacheKey(nonce, [32]byte{7: 1})
 
 	now := time.Now()
-	if _, owner := c.Acquire(key, now); !owner {
+	if _, owner, _ := c.Acquire(key, now, netip.Addr{}); !owner {
 		t.Fatal("the first Acquire must own the key")
 	}
 	if c.Len() != 1 {
@@ -317,7 +317,7 @@ func TestSynCacheAbortReleasesAReservation(t *testing.T) {
 	if c.Len() != 0 {
 		t.Fatalf("Len after Abort = %d, want 0", c.Len())
 	}
-	if _, owner := c.Acquire(key, now); !owner {
+	if _, owner, _ := c.Acquire(key, now, netip.Addr{}); !owner {
 		t.Fatal("a re-acquired key after Abort must own it again")
 	}
 
@@ -328,7 +328,7 @@ func TestSynCacheAbortReleasesAReservation(t *testing.T) {
 	if c.Len() != 1 {
 		t.Fatalf("Abort removed a completed entry; Len = %d", c.Len())
 	}
-	if ack, _ := c.Acquire(key, now); string(ack) != "ack-frame" {
+	if ack, _, _ := c.Acquire(key, now, netip.Addr{}); string(ack) != "ack-frame" {
 		t.Fatalf("Acquire returned %q, want the cached ack-frame", ack)
 	}
 }

@@ -109,14 +109,18 @@ func MaxPayloadFor(limit int) int {
 // dispatch that produced it: the MAC input is Raw minus the trailer and the
 // AEAD associated data is Raw's header.
 type Record struct {
-	Magic      uint32
-	Version    uint8
-	Cmd        uint8
-	Flags      uint16
-	SessionID  uint32
-	PacketNo   uint64
-	Seq        uint64
-	Ack        uint64
+	Magic     uint32
+	Version   uint8
+	Cmd       uint8
+	Flags     uint16
+	SessionID uint32
+	PacketNo  uint64
+	Seq       uint64
+	Ack       uint64
+	// WindowSize is RESERVED in v2: no receiver-window flow control exists,
+	// and both ends emit it as 65535. Senders must keep that value; receivers
+	// must not interpret the field. If flow control ever arrives, it will be
+	// a protocol version bump, not a silent reinterpretation.
 	WindowSize uint16
 	Data       []byte
 

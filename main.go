@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -133,8 +132,8 @@ func runServer(args []string, stdout, stderr io.Writer) int {
 		return fail(stderr, err)
 	}
 	st := srv.Stats()
-	fmt.Fprintf(stdout, "server stopped: sessions=%d auth_fail=%d decode_fail=%d replay_drop=%d queue_full=%d send_fail=%d addr_change=%d\n",
-		st.Sessions, st.AuthFailures, st.DecodeFailures, st.ReplayDrops, st.QueueFullDrops, st.SendFailures, st.AddressChanges)
+	fmt.Fprintf(stdout, "server stopped: sessions=%d auth_fail=%d decode_fail=%d replay_drop=%d queue_full=%d send_fail=%d addr_change=%d unknown_session=%d\n",
+		st.Sessions, st.AuthFailures, st.DecodeFailures, st.ReplayDrops, st.QueueFullDrops, st.SendFailures, st.AddressChanges, st.UnknownSessions)
 	return 0
 }
 
@@ -211,13 +210,32 @@ func runGenConfig(args []string, stdout, stderr io.Writer) int {
 // onSignal runs fn once on the first interrupt/terminate, and returns a
 // function that releases the handler. The handler runs on its own goroutine so
 // the command's main goroutine can keep blocking in Start().
+//
+// After the first signal the default disposition is restored: a SECOND
+// interrupt terminates the process the hard way. Swallowing it (the
+// NotifyContext shape) traps an operator whose graceful shutdown is stuck
+// behind a wedged carrier or backend with no way out but SIGKILL.
 func onSignal(fn func()) func() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	done := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		fn()
+		select {
+		case <-ch:
+			fn()
+			signal.Stop(ch)
+			signal.Reset(os.Interrupt, syscall.SIGTERM)
+		case <-done:
+		}
 	}()
-	return stop
+	return func() {
+		signal.Stop(ch)
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
 }
 
 // fail prints an error and, when it recognises the failure, an actionable

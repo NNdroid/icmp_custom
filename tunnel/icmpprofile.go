@@ -1178,6 +1178,14 @@ func (t *icmpTransport) ReadRecord(buf []byte) (int, PathID, error) {
 	for {
 		echo, err := t.platform.readEcho(buf)
 		if err != nil {
+			// A payload that cannot fit the receive buffer is junk on the
+			// wire, never a condition worth dying for: the built-in platforms
+			// pre-filter it in their pumps, but a custom platform (or a buffer
+			// smaller than the ceiling) must degrade to "drop and keep
+			// listening" instead of ending the only receive loop this end has.
+			if errors.Is(err, ErrRecordTooLarge) {
+				continue
+			}
 			if isClosedTransportErr(err) {
 				return 0, PathID{}, err
 			}
