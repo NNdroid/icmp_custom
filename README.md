@@ -44,16 +44,15 @@ go test -race ./...
 go test -bench . ./tunnel/
 ```
 
-CI (`.github/workflows/ci.yml`) runs the FULL validation on every push to
-`main`, every `v*` tag, every pull request and every manual run — no tier
-system, no skipped jobs: gofmt/vet → 3-OS test matrix (race + coverage) →
-benchmark smoke → the weak-network benchmark (fails unless every seeded
-profile delivers 100% with a fully drained ARQ) → cross builds (including
-android/arm64 and the 32-bit alignment guards) → **the Android emulator job
-runs the ping-socket carrier tests on a real Android kernel** → 32-bit
-execution and fuzz smoke under QEMU.
+CI (`.github/workflows/ci.yml`) has exactly one trigger: a push. Every push
+runs the FULL validation — no tier system, no skipped jobs: gofmt/vet → 3-OS
+test matrix (race + coverage) → benchmark smoke → the weak-network benchmark
+(fails unless every seeded profile delivers 100% with a fully drained ARQ) →
+cross builds (including android/arm64 and the 32-bit alignment guards) →
+**the Android emulator job runs the ping-socket carrier tests on a real
+Android kernel** → 32-bit execution and fuzz smoke under QEMU.
 
-Pushing a `v*` tag builds and publishes a release automatically
+Pushing a `v*` tag additionally builds and publishes a release automatically
 (`release.yml`).
 
 ## License

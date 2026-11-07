@@ -1,23 +1,17 @@
 name: CI
 
 on:
-  # Every push to main, every v* tag, every pull request and every manual run
-  # runs the FULL validation - there is no tier system and no event that
-  # skips it: lint, the 3-OS race/coverage matrix, the benchmark smoke, the
-  # weak-network delivery gate, the cross-build matrix (including the 32-bit
-  # alignment guards), the Android emulator, and the 32-bit QEMU execution
-  # with the fuzz budget.
+  # The ONLY trigger is a push of new commits: every push runs the FULL
+  # validation - lint, the 3-OS race/coverage matrix, the benchmark smoke,
+  # the weak-network delivery gate, the cross-build matrix (including the
+  # 32-bit alignment guards), the Android emulator, and the 32-bit QEMU
+  # execution with the fuzz budget. There is no tier system and no event
+  # that skips it.
   #
   # This is deliberate: a push that lands without CI has not been validated,
-  # and release gating adds a second, rarer definition of "tested" that
-  # drifts from the day-to-day one. The cost is runner minutes per push
-  # (the emulator and the QEMU fuzz budget dominate); the workflow-level
-  # trigger keeps tags and branch pushes on the same path.
+  # and no second, rarer definition of "tested" exists. The cost is runner
+  # minutes per push (the emulator and the QEMU fuzz budget dominate).
   push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
-  workflow_dispatch:
 
 permissions:
   contents: read
