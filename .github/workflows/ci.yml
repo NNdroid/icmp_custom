@@ -1,19 +1,18 @@
 name: CI
 
 on:
-  # Two tiers:
+  # Every push to main, every v* tag, every pull request and every manual run
+  # runs the FULL validation - there is no tier system and no event that
+  # skips it: lint, the 3-OS race/coverage matrix, the benchmark smoke, the
+  # weak-network delivery gate, the cross-build matrix (including the 32-bit
+  # alignment guards), the Android emulator, and the 32-bit QEMU execution
+  # with the fuzz budget.
   #
-  #   fast — every push to main and every pull request: lint, the Linux
-  #     race/coverage suite, and the weak-network delivery gate. This is the
-  #     signal a day-to-day push actually needs, in minutes.
-  #   full — v* tag pushes and manual runs (release gating): adds the rest of
-  #     the platform matrix — Windows/macOS tests, the cross-build matrix
-  #     (including the 32-bit alignment guards), the Android emulator, the
-  #     32-bit QEMU execution and fuzz smoke, and the benchmark smoke.
-  #
-  # The full tier is release gating on purpose: it is expensive (emulators,
-  # QEMU emulation, a 14-target build matrix). The fast tier is cheap and
-  # catches everything short of platform-specific divergence.
+  # This is deliberate: a push that lands without CI has not been validated,
+  # and release gating adds a second, rarer definition of "tested" that
+  # drifts from the day-to-day one. The cost is runner minutes per push
+  # (the emulator and the QEMU fuzz budget dominate); the workflow-level
+  # trigger keeps tags and branch pushes on the same path.
   push:
     branches: [main]
     tags: ['v*']
@@ -23,10 +22,6 @@ on:
 permissions:
   contents: read
 
-# The release-event condition shared by every full-tier job's `if`: v* tag
-# pushes and manual runs only. Pull requests and main pushes get the fast
-# tier. (GitHub evaluates a job-level `if` per matrix leg, which is how the
-# test job keeps only its Linux leg on the fast tier.)
 jobs:
   lint:
     name: Lint (gofmt + vet)
@@ -52,17 +47,14 @@ jobs:
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.go }})
     needs: lint
-    # Fast tier: Linux only (race + coverage). The full tier adds Windows,
-    # macOS and the stable toolchain.
-    if: ${{ matrix.tier == 'fast' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { os: ubuntu-latest, go: '1.26.x', tier: fast }
-          - { os: windows-latest, go: '1.26.x', tier: full }
-          - { os: macos-latest, go: '1.26.x', tier: full }
-          - { os: ubuntu-latest, go: 'stable', tier: full }
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        go: ['1.26.x', 'stable']
+        exclude:
+          - os: macos-latest
+            go: 'stable'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -96,9 +88,6 @@ jobs:
   bench-smoke:
     name: Benchmark smoke
     needs: lint
-    # Full tier: redundant with the fast tier on pushes (the test job runs the
-    # suite and bench-weaknet runs the delivery gate there).
-    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -119,9 +108,9 @@ jobs:
   bench-weaknet:
     name: Benchmark weak-network conditions
     needs: lint
-    # Fast tier: this is the CI gate for delivery semantics (100% delivery,
-    # zero carrier drops, fully drained ARQ), so it runs on EVERY push and PR,
-    # not just releases.
+    # This is the CI gate for delivery semantics (100% delivery,
+    # zero carrier drops, fully drained ARQ): it fails the run whenever the
+    # ARQ or reorder state cannot fully drain.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -165,8 +154,6 @@ jobs:
   cross-build:
     name: Cross build (${{ matrix.goos }}/${{ matrix.goarch }})
     needs: lint
-    # Full tier (release gating): 14 build targets.
-    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -222,8 +209,6 @@ jobs:
   android-emulator:
     name: Android emulator (ping socket on a real kernel)
     needs: lint
-    # Full tier (release gating): emulator startup dominates the cost.
-    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -283,9 +268,7 @@ jobs:
   test-32bit:
     name: Test on 32-bit (${{ matrix.goarch }} via QEMU)
     needs: lint
-    # Full tier (release gating): QEMU emulation and the fuzz budget dominate
     # the cost.
-    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
