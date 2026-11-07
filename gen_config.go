@@ -207,11 +207,14 @@ const serverTemplate = `{
   "send_window": 256,
 
   "icmp": {
-    "max_payload": 1200,     // start and hard ceiling of the MTU search
+    "max_payload": 1452,     // hard ceiling of the MTU search (fits 1500-MTU v6)
     "mtu_mode": "auto",      // auto (in-band adaptation) | fixed
     "mtu_min": 548,          // never step below (IPv4 reassembly floor)
     "mtu_step": 100,         // upward step, halved near the ceiling
-    "pace_ms": 20,           // spaces outbound packets; both ends need it
+    "pace_ms": 20,           // pace CEILING: auto starts at 2ms, decays to 1ms
+                             // while the path answers, backs off when throttled
+    "pace_mode": "auto",     // auto (adaptive AIMD) | fixed (always pace_ms)
+    "coalesce": false,       // batch records into one datagram (BOTH ends!)
     "id_range": "",          // e.g. "1000-1999"; empty = a fresh id per packet
     "probe": true,           // server-initiated reverse probe (best-effort)
     "block_timeout": "60s"   // how long a fully blocked carrier is tolerated
@@ -248,14 +251,16 @@ const clientTemplate = `{
   "handshake_backoff_ms": 400,
 
   "icmp": {
-    "max_payload": 1200,
+    "max_payload": 1452,
     "mtu_mode": "auto",
     "mtu_min": 548,
     "mtu_step": 100,
-    "pace_ms": 20,
+    "pace_ms": 20,           // pace CEILING: auto starts at 2ms and decays
+    "pace_mode": "auto",
+    "coalesce": false,       // batch records into one datagram (BOTH ends!)
     "id_range": "",
     "probe": true,
-    "polls_in_flight": 4,    // the downlink throughput ceiling (~ window / RTT)
+    "polls_in_flight": 16,   // the downlink window (~ rate x RTT records)
     "idle_poll_ms": 1000,
     "keepalive_ms": 15000,
     "block_timeout": "60s"

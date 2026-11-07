@@ -71,6 +71,28 @@ const (
 	icmpDefaultKeepMS   = 15000
 	icmpMinPaceMS       = 1
 	icmpPaceBurstFactor = 4
+
+	// Adaptive pacing (pace_mode "auto", the default). pace_ms is the
+	// CEILING — the worst-case spacing the operator tolerates — while the
+	// live pace starts at the slow-start value and decays toward the floor
+	// on evidence that the path accepts traffic, and backs off when the
+	// carrier classifies the path as throttled. The historical fixed pace
+	// (the default 20ms) is available as pace_mode "fixed"; the backoff
+	// ceiling is at least the historical value so an aggressive operator's
+	// path still falls back to the gentle spacing when it hurts.
+	icmpPaceSlowStart = 2 * time.Millisecond
+	icmpPaceFloor     = 1 * time.Millisecond
+	// icmpAIMDReplies is how many consecutively answered polls decay the
+	// pace one step (×4/5) toward the floor.
+	icmpAIMDReplies = 8
+	// icmpPaceThrottleMin is the smallest spacing a THROTTLED path falls
+	// back to, even under an aggressive pace_ms: the historical default.
+	icmpPaceThrottleMin = 20 * time.Millisecond
+
+	// icmpCoalesceMaxDelay is how long a coalescing sender holds a
+	// partially-filled datagram before flushing it. Sub-RTT by design: the
+	// added latency must be invisible next to the path's own round trip.
+	icmpCoalesceMaxDelay = 1 * time.Millisecond
 )
 
 // ---------------------------------------------------------------------------
@@ -132,6 +154,27 @@ type ICMPProfile struct {
 	// session is torn down. It is also the retransmit spacing while blocked,
 	// so a black hole is probed slowly instead of being amplified.
 	BlockTimeout string `json:"block_timeout"`
+	// PaceMode selects how the live send pace relates to PaceMS:
+	//
+	//   - "auto" (the default): PaceMS is the CEILING. The live pace starts
+	//     at min(PaceMS, 2ms), decays toward 1ms while the path keeps
+	//     answering, and backs off (doubling, never above
+	//     max(2*PaceMS, 20ms)) while the carrier classifies it throttled.
+	//     This is what lets a healthy path consume the host's ICMP allowance
+	//     (typically 1000 packets/s) instead of the historical 50.
+	//   - "fixed": the historical behaviour — always exactly PaceMS, never
+	//     adapted. The escape hatch for a path an operator already knows.
+	PaceMode string `json:"pace_mode"`
+	// Coalesce enables record coalescing on the SEND side: sealed records
+	// accumulate for at most 1ms (or until the carrier budget fills) and go
+	// out as ONE paced datagram. The receiver side needs no configuration —
+	// it always accepts both a single record and a coalesced datagram — but
+	// BOTH ends must enable Coalesce for it to engage end to end, since a
+	// receiver that split records would silently drop everything after the
+	// first one. Small-record workloads (interactive sessions, many small
+	// datagrams) see the largest win: one paced slot carries up to the full
+	// budget instead of one record.
+	Coalesce bool `json:"coalesce"`
 }
 
 // icmpFamily is the address family of one socket. The profile no longer asks
@@ -176,6 +219,8 @@ type resolvedProfile struct {
 	mtuMin        int
 	mtuStep       int
 	pace          time.Duration
+	paceAuto      bool
+	coalesce      bool
 	idSpec        string
 	probe         bool
 	pollsInFlight int
@@ -273,6 +318,16 @@ func (p ICMPProfile) resolve() (resolvedProfile, error) {
 			return out, fmt.Errorf("%w: icmp.block_timeout must be positive", ErrConfigRequired)
 		}
 	}
+
+	switch strings.ToLower(strings.TrimSpace(p.PaceMode)) {
+	case "", "auto", "adaptive":
+		out.paceAuto = true
+	case "fixed", "static":
+		out.paceAuto = false
+	default:
+		return out, fmt.Errorf("%w: icmp.pace_mode = %q (want auto or fixed)", ErrConfigRequired, p.PaceMode)
+	}
+	out.coalesce = p.Coalesce
 	return out, nil
 }
 
@@ -412,13 +467,93 @@ type pacer struct {
 	mu       sync.Mutex
 	interval time.Duration
 	next     time.Time
+
+	// Adaptive pacing state (pace_mode "auto"). base is the operator's
+	// ceiling (pace_ms); cur is the live estimate, started at the slow-start
+	// value and moved by noteHealthyReply (decay) and backoff (throttled).
+	// floor keeps the decay from spinning the loop into a tight send rate on
+	// a path with no observable cost. interval always mirrors cur whenever
+	// the adaptive machinery moves it; setInterval is the raw escape hatch
+	// the blocked state uses.
+	base     time.Duration
+	cur      time.Duration
+	floor    time.Duration
+	throttle time.Duration // backoff ceiling: max(2*base, icmpPaceThrottleMin)
 }
 
 func newPacer(interval time.Duration) *pacer {
 	if interval <= 0 {
 		interval = time.Millisecond
 	}
-	return &pacer{interval: interval}
+	p := &pacer{interval: interval}
+	p.aimdReset()
+	return p
+}
+
+// aimdReset (re)initialises the adaptive state from the configured base:
+// slow-start at min(base, icmpPaceSlowStart), never below the floor.
+// Callers must hold p.mu.
+func (p *pacer) aimdReset() {
+	p.base = p.interval
+	if p.base < icmpPaceFloor {
+		p.base = icmpPaceFloor
+	}
+	p.floor = icmpPaceFloor
+	start := icmpPaceSlowStart
+	if start > p.base {
+		start = p.base
+	}
+	if start < p.floor {
+		start = p.floor
+	}
+	p.cur = start
+	p.throttle = 2 * p.base
+	if p.throttle < icmpPaceThrottleMin {
+		p.throttle = icmpPaceThrottleMin
+	}
+}
+
+// adaptiveInterval is the live adaptive pace (pace_mode "auto").
+func (p *pacer) adaptiveInterval() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cur
+}
+
+// noteHealthyReply decays the adaptive pace one step (×4/5) toward the floor.
+// The caller supplies the evidence gating (consecutive answered polls); every
+// call here is one decay step. A path that keeps answering is telling us the
+// spacing is more conservative than it needs to be.
+func (p *pacer) noteHealthyReply() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	next := p.cur * 4 / 5
+	if next < p.floor {
+		next = p.floor
+	}
+	if next != p.cur {
+		p.cur = next
+		p.interval = next
+	}
+}
+
+// backoff doubles the adaptive pace — the throttled reaction. The ceiling is
+// max(2*base, icmpPaceThrottleMin): even an operator who configured an
+// aggressive pace falls back to at least the historical default spacing while
+// the path is being rate-limited, because every retransmit into a limiter is
+// fuel on the fire.
+func (p *pacer) backoff() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	next := p.cur * 2
+	if next > p.throttle {
+		next = p.throttle
+	}
+	if next < p.floor {
+		next = p.floor
+	}
+	p.cur = next
+	p.interval = next
 }
 
 func (p *pacer) setInterval(d time.Duration) {
@@ -860,13 +995,20 @@ func (r *recentSeqs) contains(seq uint16) bool {
 type icmpCore struct {
 	ids          idProvider
 	pace         *pacer
-	paceBase     time.Duration // the configured pace, restored by waitPace on recovery
+	paceBase     time.Duration // the configured pace (the adaptive ceiling)
+	paceAuto     bool          // pace_mode "auto": slow start + AIMD
 	blockTimeout time.Duration // also the send spacing while the carrier is blocked
+	coalesce     bool          // send-side record coalescing enabled
 	mtu          *mtuController
 	mon          *carrierMonitor
 	book         *pokeBook
 	logger       Logger
 	recent       recentSeqs
+
+	// aimdStreak counts consecutive answered polls feeding the pace decay.
+	// Plain int on purpose: every touch is on the session's single receive
+	// goroutine (ReadRecord is the only caller of noteReply).
+	aimdStreak int
 
 	probeEnabled bool
 	probeFails   atomic.Int32
@@ -883,7 +1025,9 @@ func newICMPCore(prof resolvedProfile, peer netip.AddrPort, ids idProvider, logg
 		ids:          ids,
 		pace:         newPacer(prof.pace),
 		paceBase:     prof.pace,
+		paceAuto:     prof.paceAuto,
 		blockTimeout: prof.blockTimeout,
+		coalesce:     prof.coalesce,
 		mtu:          newMTUController(prof.mtuMode, prof.maxPayload, prof.mtuMin, prof.mtuStep),
 		mon:          newCarrierMonitor(peer, prof.pace, prof.blockTimeout, logger),
 		book:         newPokeBook(),
@@ -949,11 +1093,16 @@ func (c *icmpCore) waitPace(ctx context.Context) error {
 	// the limit worse.
 	switch c.mon.State() {
 	case CarrierThrottled:
-		// Doubling the retransmit floor is only half the reaction. The path is
-		// congested, so the send rate is what has to give way; a sender that
-		// keeps offering the same packets per second keeps the limit in place
-		// and the classifier never gets to observe a recovery.
-		c.pace.setInterval(2 * c.paceBase)
+		// The path is congested, so the send rate is what has to give way: the
+		// adaptive pace doubles (capped at max(2*pace_ms, the historical
+		// default)), and a sender that keeps offering the same packets per
+		// second keeps the limit in place and the classifier never gets to
+		// observe a recovery.
+		if c.paceAuto {
+			c.pace.backoff()
+		} else {
+			c.pace.setInterval(2 * c.paceBase)
+		}
 		c.mtu.setSuspended(true)
 	case CarrierBlocked:
 		// No reply at all: probe the path as slowly as we retransmit it rather
@@ -962,7 +1111,11 @@ func (c *icmpCore) waitPace(ctx context.Context) error {
 		c.pace.setInterval(c.blockTimeout)
 		c.mtu.setSuspended(true)
 	default:
-		c.pace.setInterval(c.paceBase)
+		if c.paceAuto {
+			c.pace.setInterval(c.pace.adaptiveInterval())
+		} else {
+			c.pace.setInterval(c.paceBase)
+		}
 		c.mtu.setSuspended(false)
 	}
 	return nil
@@ -987,6 +1140,22 @@ func (c *icmpCore) noteReply(seq uint16, now time.Time) {
 	}
 	c.repliesSeen.Add(1)
 	c.mon.noteReply(now.Sub(sent))
+	// Adaptive-pace evidence: consecutive answered polls decay the send
+	// spacing toward the floor. Only a path that is neither throttled nor
+	// blocked counts — those states want the spacing WIDER, not narrower,
+	// and the streak resets so recovery starts from the backed-off value.
+	if c.paceAuto {
+		switch c.mon.State() {
+		case CarrierThrottled, CarrierBlocked:
+			c.aimdStreak = 0
+		default:
+			c.aimdStreak++
+			if c.aimdStreak >= icmpAIMDReplies {
+				c.aimdStreak = 0
+				c.pace.noteHealthyReply()
+			}
+		}
+	}
 }
 
 // noteInboundRequest records that the peer polled us. An inbound Echo Request
@@ -1167,6 +1336,7 @@ var (
 	_ CarrierCondition      = (*icmpTransport)(nil)
 	_ MTUFeedback           = (*icmpTransport)(nil)
 	_ AuthenticatedFeedback = (*icmpTransport)(nil)
+	_ RecordBatcher         = (*icmpTransport)(nil)
 )
 
 // icmpReadSlack caps how long ReadRecord will sit on a socket error before
@@ -1307,6 +1477,17 @@ func (t *icmpTransport) RecordLost(size int) { t.core.recordLost(size) }
 // carrier that a record verified, which is the only evidence that clears a
 // blocked path.
 func (t *icmpTransport) RecordAuthenticated() { t.core.noteAuthenticated() }
+
+// BatchBudget implements RecordBatcher: when the profile enables send-side
+// coalescing, the budget is the carrier's LIVE record budget (the adaptive
+// MTU moves it), and one coalesced datagram may fill it completely. Zero
+// disables coalescing.
+func (t *icmpTransport) BatchBudget() int {
+	if !t.core.coalesce {
+		return 0
+	}
+	return t.core.maxRecordSize()
+}
 
 // CarrierState implements CarrierCondition.
 func (t *icmpTransport) CarrierState() CarrierState { return t.core.carrierState() }

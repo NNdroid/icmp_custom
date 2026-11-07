@@ -31,6 +31,38 @@ func nudge(ch chan struct{}) {
 	}
 }
 
+// evidenceLen is the wire size this record reports as MTU evidence: the
+// coalesced datagram that carried it when one did, else its own length. Under
+// coalescing a small record riding a full-budget datagram IS full-budget
+// evidence; the record's own size would blind the MTU search.
+func (pkt *unackedPkt) evidenceLen() int {
+	if pkt.mtuLen > 0 {
+		return pkt.mtuLen
+	}
+	return len(pkt.wire)
+}
+
+// payloadPool recycles the receive-side payload buffers: a record's bytes are
+// copied out of the carrier's read buffer at enqueue time, held in recvQueue,
+// written to the target, and only then dead. Get returns an empty buffer to
+// append into; the delivery loop Puts each payload back after its write.
+var payloadPool = sync.Pool{
+	New: func() any { return make([]byte, 0, 1536) },
+}
+
+// payloadGet returns an empty buffer ready to append a received payload into.
+func payloadGet() []byte {
+	return payloadPool.Get().([]byte)[:0]
+}
+
+// payloadPut returns a delivered payload buffer. Oversized buffers are
+// dropped rather than pinned in the pool.
+func payloadPut(p []byte) {
+	if cap(p) <= 64<<10 {
+		payloadPool.Put(p[:0])
+	}
+}
+
 // earliestRetransmitDelay reports how long until the earliest outstanding
 // record is due for retransmission, or false when nothing is outstanding.
 //
@@ -116,7 +148,7 @@ func (p *retransmitSweep) run() bool {
 		// retries run out, and the carrier's classifier suppresses this
 		// while the path is throttled.
 		if p.fed != nil {
-			p.fed.RecordLost(len(pkt.wire))
+			p.fed.RecordLost(pkt.evidenceLen())
 		}
 		pkt.retries++
 		if pkt.retries > p.maxRetries {

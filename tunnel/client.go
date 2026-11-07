@@ -168,12 +168,14 @@ type Client struct {
 	// mtuFed and authFed are the carrier's optional feedback capabilities,
 	// resolved once (the carrier is immutable). Both are nil for an ordinary
 	// carrier and every use is nil-checked. poller and cond are the same story
-	// for the request-driven send path and the retransmit floor: the per-record
-	// poke path must not re-assert an interface per packet.
+	// for the request-driven send path and the retransmit floor, batcher for
+	// send-side coalescing: the per-record paths must not re-assert an
+	// interface per packet.
 	mtuFed  MTUFeedback
 	authFed AuthenticatedFeedback
 	poller  Poller
 	cond    CarrierCondition
+	batcher RecordBatcher
 
 	maxRecvQueue int
 
@@ -242,6 +244,7 @@ func NewClientWithTransport(cfg ClientConfig, tr Transport) (*Client, error) {
 		authFed:       authenticatedFeedbackOf(tr),
 		poller:        pollerOf(tr),
 		cond:          carrierConditionOf(tr),
+		batcher:       batcherOf(tr),
 		maxRecvQueue:  512,
 		pendingAcks:   make(map[[ClientNonceSize]byte]*pendingHandshake),
 		events:        newEventBus[ClientEvent](128),
@@ -426,11 +429,13 @@ func (c *Client) readLoop() {
 			c.logWarn("[Client] carrier read error: %v", err)
 			return
 		}
-		var rec Record
-		if err := Parse(buf[:n], c.magic, c.maxRecordSize, &rec); err != nil {
-			continue // junk, a foreign reply, or a truncated record
-		}
-		c.dispatch(buf[:n], &rec)
+		// One datagram may carry SEVERAL concatenated records (coalescing);
+		// walk them all. Junk from byte 0 yields no calls; garbage trailing
+		// valid records is dropped silently (each record authenticates
+		// independently, and the peer retransmits what never arrived).
+		forEachRecord(buf[:n], c.magic, c.maxRecordSize, func(raw []byte, rec *Record) {
+			c.dispatch(raw, rec)
+		})
 	}
 }
 
@@ -912,6 +917,16 @@ type clientSession struct {
 	deliverWake    chan struct{}
 	retransmitWake chan struct{}
 
+	// Send coalescing (only when the carrier implements RecordBatcher):
+	// sealed DATA records accumulate here for at most
+	// icmpCoalesceMaxDelay — or until the batch budget fills — and go out as
+	// ONE paced Echo Request. Control records (ACKs, PONGs, FINs) never
+	// batch: they must stay prompt, and their send paths bypass this.
+	batchMu    sync.Mutex
+	batch      []byte
+	batchSeqs  []uint64
+	batchTimer *time.Timer
+
 	unacked     map[uint64]*unackedPkt
 	unackedLow  uint64 // lowest still-unacked seq; the unacked map is contiguous [unackedLow, max]
 	unackedMu   sync.Mutex
@@ -969,6 +984,10 @@ func (s *clientSession) close() {
 		s.unackedMu.Unlock()
 		close(s.closeChan)
 		if s.conn != nil {
+			// Any coalesced-but-unsent DATA goes before the FIN: it is in the
+			// unacked map, so dropping it would be self-healing, but sending
+			// it now is free.
+			s.flushBatch()
 			// Tell the server to tear the session down; best effort.
 			fin := &Record{Magic: s.client.magic, Version: Version, Cmd: CmdFin, SessionID: s.sid}
 			s.sendControl(fin, s.poke)
@@ -1100,6 +1119,14 @@ func (s *clientSession) sendData(payload []byte) error {
 	// outstanding): tell it the outstanding set changed so it re-arms.
 	nudge(s.retransmitWake)
 
+	// Coalescing carriers take the batch route: the record rides with its
+	// neighbours as one paced Echo Request, and the request still discharges
+	// the downlink window when its replies arrive.
+	if s.client.batcher != nil {
+		s.batchSend(encoded, seq)
+		return nil
+	}
+
 	// A carrier write failure during a route transition is equivalent to packet
 	// loss: the retained record is retried by retransmitLoop, so tearing the
 	// session down here would defeat that machinery.
@@ -1107,6 +1134,85 @@ func (s *clientSession) sendData(payload []byte) error {
 		s.client.logWarn("[Client] [Session 0x%08X] initial DATA send deferred to retransmit loop: %v", s.sid, err)
 	}
 	return nil
+}
+
+// batchSend appends one sealed record to the coalescing batch, flushing what
+// is there first when the record would overflow the carrier budget, and
+// arming the flush timer on the first record of a batch.
+func (s *clientSession) batchSend(wire []byte, seq uint64) {
+	budget := s.client.batcher.BatchBudget()
+	s.batchMu.Lock()
+	var overflow []byte
+	var overflowSeqs []uint64
+	if len(s.batch) > 0 && len(s.batch)+len(wire) > budget {
+		overflow, overflowSeqs = s.flushBatchLocked()
+	}
+	if s.batch == nil {
+		s.batch = make([]byte, 0, budget)
+		s.batchSeqs = s.batchSeqs[:0]
+	}
+	s.batch = append(s.batch, wire...)
+	s.batchSeqs = append(s.batchSeqs, seq)
+	full := len(s.batch) >= budget
+	if s.batchTimer == nil && !full {
+		// Sub-RTT by design: the coalescing delay must be invisible next to
+		// the path's own round trip, or interactive traffic would feel it.
+		s.batchTimer = time.AfterFunc(icmpCoalesceMaxDelay, s.flushBatch)
+	}
+	s.batchMu.Unlock()
+	if overflow != nil {
+		s.dispatchBatch(overflow, overflowSeqs)
+	}
+	if full {
+		s.flushBatch()
+	}
+}
+
+// flushBatchLocked swaps out the pending batch. The caller holds batchMu and
+// is responsible for dispatching what it gets back.
+func (s *clientSession) flushBatchLocked() ([]byte, []uint64) {
+	if s.batchTimer != nil {
+		s.batchTimer.Stop()
+		s.batchTimer = nil
+	}
+	wire := s.batch
+	seqs := s.batchSeqs
+	s.batch = nil
+	s.batchSeqs = nil
+	return wire, seqs
+}
+
+// flushBatch sends the pending coalesced batch as one Echo Request. Every
+// constituent is individually in the unacked map (the retransmit loop never
+// resends a batch, only its records), and each constituent's mtuLen is
+// stamped with the batch's wire size so MTU evidence keeps its datagram
+// granularity.
+func (s *clientSession) flushBatch() {
+	s.batchMu.Lock()
+	wire, seqs := s.flushBatchLocked()
+	s.batchMu.Unlock()
+	s.dispatchBatch(wire, seqs)
+}
+
+// dispatchBatch stamps the constituents' MTU evidence and sends the datagram.
+// Called with an already-swapped batch (never under batchMu: the send paces
+// and can block).
+func (s *clientSession) dispatchBatch(wire []byte, seqs []uint64) {
+	if len(wire) == 0 {
+		return
+	}
+	s.unackedMu.Lock()
+	for _, seq := range seqs {
+		if pkt, ok := s.unacked[seq]; ok {
+			pkt.mtuLen = len(wire)
+		}
+	}
+	s.unackedMu.Unlock()
+	// One poke for the whole batch: the poll window's outstanding count
+	// deliberately runs on requests, and the receive path credits one answer
+	// per inbound record, so a batch's N replies simply over-credit — the
+	// signed accounting in maybePoll tolerates that.
+	_ = s.poke(wire)
 }
 
 func (s *clientSession) handleAck(ackSeq uint64) {
@@ -1141,7 +1247,7 @@ func (s *clientSession) handleAck(ackSeq uint64) {
 			continue
 		}
 		if fed != nil && pkt.retries == 0 {
-			fed.RecordAcked(len(pkt.wire))
+			fed.RecordAcked(pkt.evidenceLen())
 		}
 		delete(s.unacked, seq)
 	}
@@ -1379,7 +1485,7 @@ func (s *clientSession) enqueueData(rec *Record) bool {
 			s.recvMu.Unlock()
 			return false
 		}
-		s.recvQueue[rec.Seq] = append([]byte(nil), rec.Data...)
+		s.recvQueue[rec.Seq] = append(payloadGet(), rec.Data...)
 		// Only a HOLE-FILLING record (seq == next) may advance the enqueue
 		// watermark, and it advances across the contiguous run that just
 		// became complete. An out-of-order record must leave the watermark
@@ -1452,11 +1558,32 @@ func (s *clientSession) deliverPending() bool {
 	// goroutine forever. The server retransmits unacknowledged data, so a
 	// delivery dropped here is self-healing.
 	_ = s.conn.SetWriteDeadline(time.Now().Add(clientAppWriteTimeout))
-	for _, payload := range run {
-		if err := writeAll(s.conn, payload); err != nil {
+	// The local end is always a byte stream (net.Pipe): the whole run goes as
+	// ONE write — the records were split only by the carrier's budget.
+	if len(run) > 1 {
+		total := 0
+		for _, p := range run {
+			total += len(p)
+		}
+		merged := make([]byte, 0, total)
+		for _, p := range run {
+			merged = append(merged, p...)
+		}
+		if err := writeAll(s.conn, merged); err != nil {
 			s.closeWithReason("application write failed")
 			return true
 		}
+	} else {
+		for _, payload := range run {
+			if err := writeAll(s.conn, payload); err != nil {
+				s.closeWithReason("application write failed")
+				return true
+			}
+		}
+	}
+	// Every payload in the run was written: recycle the buffers.
+	for _, p := range run {
+		payloadPut(p)
 	}
 	s.ackedSeq.Store(next - 1)
 	s.sendACK(next - 1)

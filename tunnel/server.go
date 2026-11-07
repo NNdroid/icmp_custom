@@ -137,10 +137,11 @@ type Server struct {
 	// resolved once at construction (the carrier is immutable) so the per-record
 	// paths never re-assert an interface. Both are nil for an ordinary carrier,
 	// which is nearly all of them, and every use is nil-checked. cond is the
-	// same story for the retransmit floor.
+	// same story for the retransmit floor, batcher for send-side coalescing.
 	mtuFed  MTUFeedback
 	authFed AuthenticatedFeedback
 	cond    CarrierCondition
+	batcher RecordBatcher
 
 	privKey    [32]byte
 	hasPrivKey bool
@@ -220,6 +221,7 @@ func NewServerWithTransport(cfg ServerConfig, tr Transport, dial TargetDialer) (
 		mtuFed:        mtuFeedbackOf(tr),
 		authFed:       authenticatedFeedbackOf(tr),
 		cond:          carrierConditionOf(tr),
+		batcher:       batcherOf(tr),
 		closeChan:     make(chan struct{}),
 		events:        newEventBus[SessionEvent](256),
 		synCache:      newSynCache(),
@@ -318,57 +320,64 @@ func (s *Server) readLoop() {
 			s.logWarn("[Server] carrier read error: %v", err)
 			return
 		}
-		var rec Record
-		if err := Parse(buf[:n], s.cfg.Magic, s.maxRecordSize, &rec); err != nil {
+		// One datagram may carry SEVERAL concatenated records (coalescing);
+		// walk them all. A datagram that is junk from byte 0 keeps the
+		// decode-failure accounting; garbage trailing valid records is
+		// dropped silently (each record authenticates independently).
+		handled := forEachRecord(buf[:n], s.cfg.Magic, s.maxRecordSize, func(raw []byte, rec *Record) {
+			if levelOf(s.logger) <= LogLevelDebug {
+				s.logDebug("[Recv] peer=%s ident=%d seq=%d cmd=0x%02X sid=0x%08X len=%d",
+					path.Peer, path.Ident, path.Seq, rec.Cmd, rec.SessionID, len(raw))
+			}
+
+			if rec.Cmd == CmdHandshakeSyn {
+				// Cheap DoS gates before anything expensive: per-IP rate
+				// limit, then the (verifying) handshake goroutine.
+				if ip := ipOf(path.Peer); !s.synLimiter.Allow(ip, time.Now()) {
+					s.logWarn("[Handshake] rate-limited SYN from %s", path.Peer)
+					return
+				}
+				if rec.SessionID != 0 || rec.PacketNo != 0 || rec.Seq != 0 || rec.Ack != 0 || len(rec.Data) < SynPayloadBase {
+					return
+				}
+				var clientNonce [ClientNonceSize]byte
+				copy(clientNonce[:], rec.Data[:ClientNonceSize])
+				matchedPSK := matchSynPSK(rec.Raw(), s.cfg.Passwords, clientNonce)
+				if matchedPSK == "" {
+					s.logWarn("[Handshake] rejected SYN from %s: record MAC verification failed", path.Peer)
+					return
+				}
+				// The read buffer is reused while verification runs
+				// asynchronously, so retain this record — exactly this
+				// record's bytes, not the whole coalesced datagram.
+				owned, err := ParseOwned(raw, s.cfg.Magic, s.maxRecordSize)
+				if err != nil {
+					return
+				}
+				go s.handleHandshake(path, owned, matchedPSK)
+				return
+			}
+
+			// Dispatch to an existing session. The inner v2 SessionID is the
+			// only authoritative session key; the carrier's Ident is a cheap
+			// prefilter.
+			if v, ok := s.sessions.Load(rec.SessionID); ok && v != nil {
+				v.(*ServerSession).processIncomingRecord(rec, path)
+			} else {
+				// Structurally valid but addressed to a session this server
+				// never established. Counted (throttled log): a flood of
+				// these is the signature of a scanner guessing SessionIDs,
+				// and without the counter that traffic is invisible to Stats
+				// and SIEM alike.
+				if c := s.unknownSessionDrops.Add(1); c == 1 || c%1000 == 0 {
+					s.logWarn("[Server] record for unknown session 0x%08X cmd=0x%02X from %s (count=%d)",
+						rec.SessionID, rec.Cmd, path.Peer, c)
+				}
+			}
+		})
+		if !handled {
 			if c := s.decodeFailures.Add(1); c == 1 || c%1000 == 0 {
-				s.logWarn("[Server] undecodable record from %s (%d bytes): %v (count=%d)", path.Peer, n, err, c)
-			}
-			continue
-		}
-		if levelOf(s.logger) <= LogLevelDebug {
-			s.logDebug("[Recv] peer=%s ident=%d seq=%d cmd=0x%02X sid=0x%08X len=%d",
-				path.Peer, path.Ident, path.Seq, rec.Cmd, rec.SessionID, n)
-		}
-
-		if rec.Cmd == CmdHandshakeSyn {
-			// Cheap DoS gates before anything expensive: per-IP rate limit,
-			// then the (verifying) handshake goroutine.
-			if ip := ipOf(path.Peer); !s.synLimiter.Allow(ip, time.Now()) {
-				s.logWarn("[Handshake] rate-limited SYN from %s", path.Peer)
-				continue
-			}
-			if rec.SessionID != 0 || rec.PacketNo != 0 || rec.Seq != 0 || rec.Ack != 0 || len(rec.Data) < SynPayloadBase {
-				continue
-			}
-			var clientNonce [ClientNonceSize]byte
-			copy(clientNonce[:], rec.Data[:ClientNonceSize])
-			matchedPSK := matchSynPSK(rec.Raw(), s.cfg.Passwords, clientNonce)
-			if matchedPSK == "" {
-				s.logWarn("[Handshake] rejected SYN from %s: record MAC verification failed", path.Peer)
-				continue
-			}
-			// The read buffer is reused while verification runs asynchronously,
-			// so retain this record.
-			owned, err := ParseOwned(buf[:n], s.cfg.Magic, s.maxRecordSize)
-			if err != nil {
-				continue
-			}
-			go s.handleHandshake(path, owned, matchedPSK)
-			continue
-		}
-
-		// Dispatch to an existing session. The inner v2 SessionID is the only
-		// authoritative session key; the carrier's Ident is a cheap prefilter.
-		if v, ok := s.sessions.Load(rec.SessionID); ok && v != nil {
-			v.(*ServerSession).processIncomingRecord(&rec, path)
-		} else {
-			// Structurally valid but addressed to a session this server never
-			// established. Counted (throttled log): a flood of these is the
-			// signature of a scanner guessing SessionIDs, and without the
-			// counter that traffic is invisible to Stats and SIEM alike.
-			if c := s.unknownSessionDrops.Add(1); c == 1 || c%1000 == 0 {
-				s.logWarn("[Server] record for unknown session 0x%08X cmd=0x%02X from %s (count=%d)",
-					rec.SessionID, rec.Cmd, path.Peer, c)
+				s.logWarn("[Server] undecodable record from %s (%d bytes) (count=%d)", path.Peer, n, c)
 			}
 		}
 	}
@@ -914,6 +923,13 @@ type unackedPkt struct {
 	sentTime  time.Time
 	rto       time.Duration
 	retries   int
+	// mtuLen is the wire size of the datagram that actually carried this
+	// record — the coalesced batch when one did, else len(wire). It is the
+	// unit of MTU evidence: under coalescing a 200-byte record riding a
+	// full-budget datagram IS full-budget evidence, and feeding the record's
+	// own size instead would blind the MTU search for every small-record
+	// workload. Zero means "not coalesced"; consumers fall back to len(wire).
+	mtuLen int
 }
 
 // synRecord caches the result of a verified handshake so a retransmitted or
@@ -1174,6 +1190,16 @@ type ServerSession struct {
 	// (a record was added) so it can re-arm to an earlier deadline.
 	deliverWake    chan struct{}
 	retransmitWake chan struct{}
+
+	// Send coalescing (only when the carrier implements RecordBatcher):
+	// sealed DATA records accumulate here for at most
+	// icmpCoalesceMaxDelay — or until the batch budget fills — and go out as
+	// ONE paced datagram. Control records never batch: ACKs, PONGs and FINs
+	// must stay prompt, and their send paths bypass this entirely.
+	batchMu    sync.Mutex
+	batch      []byte
+	batchSeqs  []uint64
+	batchTimer *time.Timer
 
 	unacked     map[uint64]*unackedPkt
 	unackedLow  uint64 // lowest still-unacked seq; the unacked map is contiguous [unackedLow, max]
@@ -1521,7 +1547,7 @@ func (sess *ServerSession) handleAck(ackSeq uint64) {
 			continue
 		}
 		if fed != nil && pkt.retries == 0 {
-			fed.RecordAcked(len(pkt.wire))
+			fed.RecordAcked(pkt.evidenceLen())
 		}
 		delete(sess.unacked, seq)
 	}
@@ -1579,7 +1605,7 @@ func (sess *ServerSession) enqueueDataFromPath(rec *Record, path PathID) bool {
 			sess.server.queueFullDrops.Add(1)
 			return false
 		}
-		sess.recvQueue[rec.Seq] = append([]byte(nil), rec.Data...)
+		sess.recvQueue[rec.Seq] = append(payloadGet(), rec.Data...)
 		// Only a HOLE-FILLING record (seq == next) may advance the enqueue
 		// watermark, and it advances across the contiguous run that just
 		// became complete. An out-of-order record must leave the watermark
@@ -1654,12 +1680,36 @@ func (sess *ServerSession) deliverPending() bool {
 	if len(run) == 0 {
 		return false
 	}
-	for _, payload := range run {
-		if err := sess.writeToTarget(payload); err != nil {
+	// A stream target takes the whole run as ONE write: the records were
+	// split only by the carrier's budget, the byte stream has no boundaries,
+	// and one syscall per run beats one per record. UDP keeps per-datagram
+	// writes — its records ARE datagram boundaries.
+	if len(run) > 1 && sess.targetNetwork != "udp" {
+		total := 0
+		for _, p := range run {
+			total += len(p)
+		}
+		merged := make([]byte, 0, total)
+		for _, p := range run {
+			merged = append(merged, p...)
+		}
+		if err := sess.writeToTarget(merged); err != nil {
 			sess.server.logWarn("[Session 0x%08X] target write failed: %v", sess.sessionID, err)
 			sess.Close()
 			return true
 		}
+	} else {
+		for _, payload := range run {
+			if err := sess.writeToTarget(payload); err != nil {
+				sess.server.logWarn("[Session 0x%08X] target write failed: %v", sess.sessionID, err)
+				sess.Close()
+				return true
+			}
+		}
+	}
+	// Every payload in the run was written: recycle the buffers.
+	for _, p := range run {
+		payloadPut(p)
 	}
 	sess.ackedSeq.Store(next - 1)
 	// Ack the highest contiguous sequence actually delivered. The reply path
@@ -1804,10 +1854,93 @@ func (sess *ServerSession) sendData(payload []byte) error {
 	// outstanding): tell it the outstanding set changed so it re-arms.
 	nudge(sess.retransmitWake)
 
+	// Coalescing carriers take the batch route: the record goes out with its
+	// neighbours as one paced datagram. Everything else sends immediately.
+	if sess.server.batcher != nil {
+		sess.batchSend(encoded, seq)
+		return nil
+	}
+
 	// Server-initiated: mirror the most recently observed path so whatever
 	// demultiplexing the peer requires keeps working.
 	sess.sendToSession(encoded)
 	return nil
+}
+
+// batchSend appends one sealed record to the coalescing batch, flushing what
+// is there first when the record would overflow the carrier budget, and
+// arming the flush timer on the first record of a batch.
+func (sess *ServerSession) batchSend(wire []byte, seq uint64) {
+	budget := sess.server.batcher.BatchBudget()
+	sess.batchMu.Lock()
+	var overflow []byte
+	var overflowSeqs []uint64
+	if len(sess.batch) > 0 && len(sess.batch)+len(wire) > budget {
+		// This record does not fit: dispatch what is pending and start fresh.
+		overflow, overflowSeqs = sess.flushBatchLocked()
+	}
+	if sess.batch == nil {
+		sess.batch = make([]byte, 0, budget)
+		sess.batchSeqs = sess.batchSeqs[:0]
+	}
+	sess.batch = append(sess.batch, wire...)
+	sess.batchSeqs = append(sess.batchSeqs, seq)
+	full := len(sess.batch) >= budget
+	if sess.batchTimer == nil && !full {
+		// Sub-RTT by design: the coalescing delay must be invisible next to
+		// the path's own round trip, or interactive traffic would feel it.
+		sess.batchTimer = time.AfterFunc(icmpCoalesceMaxDelay, sess.flushBatch)
+	}
+	sess.batchMu.Unlock()
+	if overflow != nil {
+		sess.dispatchBatch(overflow, overflowSeqs)
+	}
+	if full {
+		sess.flushBatch()
+	}
+}
+
+// flushBatchLocked swaps out the pending batch. The caller holds batchMu and
+// is responsible for dispatching what it gets back.
+func (sess *ServerSession) flushBatchLocked() ([]byte, []uint64) {
+	if sess.batchTimer != nil {
+		sess.batchTimer.Stop()
+		sess.batchTimer = nil
+	}
+	wire := sess.batch
+	seqs := sess.batchSeqs
+	sess.batch = nil
+	sess.batchSeqs = nil
+	return wire, seqs
+}
+
+// flushBatch sends the pending coalesced batch as one datagram. A record is
+// acknowledged only after this datagram reaches the peer, so the batch is
+// also the unit of MTU evidence: every constituent's mtuLen is stamped with
+// the batch's wire size, and a retired record then reports the true datagram
+// size to the MTU search instead of its own (possibly tiny) length.
+func (sess *ServerSession) flushBatch() {
+	sess.batchMu.Lock()
+	wire, seqs := sess.flushBatchLocked()
+	sess.batchMu.Unlock()
+	sess.dispatchBatch(wire, seqs)
+}
+
+// dispatchBatch stamps the constituents' MTU evidence and sends the datagram.
+// Called with an already-swapped batch (never under batchMu: the send paces
+// and can block).
+func (sess *ServerSession) dispatchBatch(wire []byte, seqs []uint64) {
+	if len(wire) == 0 {
+		return
+	}
+	sess.unackedMu.Lock()
+	for _, seq := range seqs {
+		if pkt, ok := sess.unacked[seq]; ok {
+			pkt.mtuLen = len(wire)
+		}
+	}
+	sess.unackedMu.Unlock()
+	sess.sendToSession(wire)
 }
 
 // upstreamLoop pumps the backend connection into the tunnel. For "udp" targets
@@ -1936,7 +2069,10 @@ func (sess *ServerSession) Close() {
 		// turns a server-side teardown (target write failure, idle timeout,
 		// max retries) into a prompt local error instead of an application
 		// hanging until its own idle timeout. Best effort — the peer may
-		// already be gone, and the carrier may already be closed.
+		// already be gone, and the carrier may already be closed. Any
+		// coalesced-but-unsent DATA goes first: it is in the unacked map, so
+		// dropping it would be self-healing, but sending it now is free.
+		sess.flushBatch()
 		sess.sendControl(&Record{
 			Magic:     sess.server.cfg.Magic,
 			Version:   Version,

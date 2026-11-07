@@ -136,6 +136,32 @@ type AuthenticatedFeedback interface {
 	RecordAuthenticated()
 }
 
+// RecordBatcher is implemented by carriers whose receiver accepts SEVERAL
+// concatenated records per datagram, so the sender may coalesce: sealed
+// records accumulate for a bounded moment (sub-RTT) and go out as one paced
+// datagram, which is what turns a small-record workload from "one paced slot
+// per record" into "one paced slot per budget".
+//
+// BatchBudget returns the largest coalesced datagram the sender may emit —
+// normally the carrier's record budget. A carrier that does not implement the
+// interface (or returns <= 0) disables send-side coalescing; the receiver
+// accepts both shapes unconditionally, so coalescing can never surprise a
+// peer that opted in.
+type RecordBatcher interface {
+	BatchBudget() int
+}
+
+// batcherOf returns the carrier's optional RecordBatcher, or nil when the
+// carrier disables send-side coalescing. Callers must nil-check before use.
+func batcherOf(tr Transport) RecordBatcher {
+	if b, ok := tr.(RecordBatcher); ok {
+		if b.BatchBudget() > 0 {
+			return b
+		}
+	}
+	return nil
+}
+
 // Poller is implemented by request-triggered carriers (ICMP Echo). Downlink can
 // only be delivered in reply to a request, so the endpoint must emit polls.
 // A datagram carrier such as UDP simply does not implement Poller, and the

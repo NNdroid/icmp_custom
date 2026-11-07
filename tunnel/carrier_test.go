@@ -117,8 +117,11 @@ func TestApplyICMPPollScheduleFillsOnlyZeroFields(t *testing.T) {
 	})
 }
 
-// The default profile must reproduce the client's historical defaults, so
-// introducing the profile did not silently change the poll cadence.
+// The default profile pins the DEFAULT poll cadence — deliberately changed
+// with pace_mode "auto": the poll cadence is the downlink throughput ceiling,
+// so it now starts at the adaptive pace's slow-start value (2ms) instead of
+// the historical 20ms ceiling. The historical cadence remains available via
+// pace_mode "fixed" (asserted below through the profile-reflecting test).
 func TestApplyICMPPollScheduleReproducesTheClientDefaults(t *testing.T) {
 	resolved, err := (ICMPProfile{}).resolve()
 	if err != nil {
@@ -135,12 +138,12 @@ func TestApplyICMPPollScheduleReproducesTheClientDefaults(t *testing.T) {
 	}
 	want := PollSchedule{
 		PollsInFlight: defaultPollsInFlight,
-		PollInterval:  defaultPollInterval,
+		PollInterval:  icmpPaceSlowStart, // min(pace_ms=20ms, slow start 2ms)
 		IdlePoll:      defaultIdlePollInterval,
 		KeepAlive:     defaultKeepAlive,
 	}
 	if got != want {
-		t.Fatalf("default profile produced %+v, want the client defaults %+v", got, want)
+		t.Fatalf("default profile produced %+v, want %+v", got, want)
 	}
 }
 
@@ -148,42 +151,67 @@ func TestClientPollScheduleReflectsTheProfile(t *testing.T) {
 	a, _ := newFakeLink("client", "server", 2048)
 	defer a.Close()
 
-	cli, err := NewClientWithTransport(ClientConfig{
-		ICMP:       ICMPProfile{PollsInFlight: 6, PaceMS: 30, IdlePollMS: 250, KeepAliveMS: 3000},
-		ServerAddr: "203.0.113.9",
-		Passwords:  []string{"secret"},
-		ListenAddr: "127.0.0.1:1080",
-	}, a)
-	if err != nil {
-		t.Fatalf("NewClientWithTransport: %v", err)
-	}
-	defer cli.Close()
+	t.Run("auto pace starts the poll cadence at slow start", func(t *testing.T) {
+		cli, err := NewClientWithTransport(ClientConfig{
+			ICMP:       ICMPProfile{PollsInFlight: 6, PaceMS: 30, IdlePollMS: 250, KeepAliveMS: 3000},
+			ServerAddr: "203.0.113.9",
+			Passwords:  []string{"secret"},
+			ListenAddr: "127.0.0.1:1080",
+		}, a)
+		if err != nil {
+			t.Fatalf("NewClientWithTransport: %v", err)
+		}
+		defer cli.Close()
 
-	// NewClientWithTransport does not map the profile: it takes the carrier as
-	// given. Mapping is NewClient's job, so apply it here to observe the pair
-	// the CLI path would produce.
-	resolved, err := cli.cfg.ICMP.resolve()
-	if err != nil {
-		t.Fatalf("resolve profile: %v", err)
-	}
-	cfg := cli.cfg
-	applyICMPPollSchedule(&cfg, resolved)
+		// NewClientWithTransport does not map the profile: it takes the carrier as
+		// given. Mapping is NewClient's job, so apply it here to observe the pair
+		// the CLI path would produce.
+		resolved, err := cli.cfg.ICMP.resolve()
+		if err != nil {
+			t.Fatalf("resolve profile: %v", err)
+		}
+		cfg := cli.cfg
+		applyICMPPollSchedule(&cfg, resolved)
 
-	got := PollSchedule{
-		PollsInFlight: cfg.pollsInFlight(),
-		PollInterval:  cfg.pollInterval(),
-		IdlePoll:      cfg.idlePoll(),
-		KeepAlive:     cfg.keepAlive(),
-	}
-	want := PollSchedule{
-		PollsInFlight: 6,
-		PollInterval:  30 * time.Millisecond,
-		IdlePoll:      250 * time.Millisecond,
-		KeepAlive:     3 * time.Second,
-	}
-	if got != want {
-		t.Fatalf("PollSchedule = %+v, want %+v", got, want)
-	}
+		got := PollSchedule{
+			PollsInFlight: cfg.pollsInFlight(),
+			PollInterval:  cfg.pollInterval(),
+			IdlePoll:      cfg.idlePoll(),
+			KeepAlive:     cfg.keepAlive(),
+		}
+		want := PollSchedule{
+			PollsInFlight: 6,
+			PollInterval:  icmpPaceSlowStart, // auto: min(30ms, 2ms)
+			IdlePoll:      250 * time.Millisecond,
+			KeepAlive:     3 * time.Second,
+		}
+		if got != want {
+			t.Fatalf("PollSchedule = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("fixed pace keeps the verbatim value", func(t *testing.T) {
+		cli, err := NewClientWithTransport(ClientConfig{
+			ICMP:       ICMPProfile{PaceMS: 30, PaceMode: "fixed"},
+			ServerAddr: "203.0.113.9",
+			Passwords:  []string{"secret"},
+			ListenAddr: "127.0.0.1:1080",
+		}, a)
+		if err != nil {
+			t.Fatalf("NewClientWithTransport: %v", err)
+		}
+		defer cli.Close()
+
+		resolved, err := cli.cfg.ICMP.resolve()
+		if err != nil {
+			t.Fatalf("resolve profile: %v", err)
+		}
+		cfg := cli.cfg
+		applyICMPPollSchedule(&cfg, resolved)
+		if cfg.pollInterval() != 30*time.Millisecond {
+			t.Fatalf("fixed pace poll interval = %v, want the verbatim 30ms", cfg.pollInterval())
+		}
+	})
 }
 
 func TestICMPProfileValidateMirrorsResolve(t *testing.T) {

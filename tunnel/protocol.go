@@ -219,6 +219,48 @@ func Parse(buf []byte, magic uint32, limit int, dst *Record) error {
 	return nil
 }
 
+// forEachRecord walks a datagram that may carry SEVERAL concatenated v2
+// records and invokes fn for each structurally complete one, in wire order.
+//
+// This is what makes record coalescing possible: a sender may pack as many
+// sealed records as fit its carrier budget into one datagram, and a receiver
+// splits them here without any new wire format — every record is
+// self-delimiting (fixed header + PayloadLen + tag), so a datagram holding a
+// single record, the historical shape, parses identically with zero remainder.
+// A receiver that implements this loop therefore accepts BOTH shapes.
+//
+// The walk stops at the first structural error. Garbage AFTER at least one
+// valid record is dropped silently: each record is independently
+// authenticated (AEAD / HMAC), so a corrupt tail cannot taint the head
+// records, and the sender retransmits anything the receiver never
+// acknowledged. The returned bool reports whether at least one record was
+// seen — callers use it to tell "junk datagram" (worth a decode-failure
+// counter) from "coalesced tail" (not).
+//
+// fn's raw argument aliases data and is only valid for the duration of the
+// call; rec borrows the same bytes.
+func forEachRecord(data []byte, magic uint32, limit int, fn func(raw []byte, rec *Record)) bool {
+	seen := false
+	for len(data) >= RecordMinSize {
+		// Peek the payload length so the record can be ISOLATED before
+		// parsing: Parse demands a buffer that is exactly one record, and in
+		// a coalesced datagram that record is only a prefix of what remains.
+		dataLen := int(binary.BigEndian.Uint16(data[38:40]))
+		total := RecordHdrSize + dataLen + RecordTagSize
+		if total > len(data) {
+			return seen // truncated tail: drop it
+		}
+		var rec Record
+		if err := Parse(data[:total], magic, limit, &rec); err != nil {
+			return seen
+		}
+		fn(data[:total], &rec)
+		seen = true
+		data = data[total:]
+	}
+	return seen
+}
+
 // ParseOwned decodes a record and copies it so the caller may release buf. Use
 // it only when the record must outlive the read buffer (for example a SYN
 // handed to an asynchronous handshake goroutine).

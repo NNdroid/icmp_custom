@@ -94,11 +94,18 @@ func applyICMPPollSchedule(cfg *ClientConfig, p resolvedProfile) {
 		cfg.PollsInFlight = p.pollsInFlight
 	}
 	if cfg.PollInterval == 0 {
-		// The active poll spacing must not be tighter than the carrier's own
-		// pacing, or the session would queue requests the pacer then delays,
-		// turning a smooth window into sawtooth. Aligning them is the whole
-		// point of reading pace here.
+		// The poll cadence is the downlink throughput ceiling: one poll's
+		// reply carries the downlink, so polls-per-second × payload IS the
+		// rate. Under the adaptive pace the spacing starts at the pace's own
+		// slow-start value rather than the ceiling — the whole point of
+		// pace_mode "auto" is that a healthy path may run far tighter than
+		// pace_ms — and any tighter spacing is harmless anyway, because every
+		// outbound packet still goes through the pacer. Fixed-pace profiles
+		// keep the verbatim value.
 		cfg.PollInterval = p.pace
+		if p.paceAuto && icmpPaceSlowStart < cfg.PollInterval {
+			cfg.PollInterval = icmpPaceSlowStart
+		}
 	}
 	if cfg.IdlePollInterval == 0 {
 		cfg.IdlePollInterval = p.idlePoll
