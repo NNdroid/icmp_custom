@@ -44,9 +44,18 @@ go test -race ./...
 go test -bench . ./tunnel/
 ```
 
-CI (`.github/workflows/ci.yml`): gofmt/vet → 3-OS test matrix (race + coverage)
-→ benchmark smoke → cross builds (including android/arm64) → **the Android
-emulator job runs the ping-socket carrier tests on a real Android kernel**.
+CI (`.github/workflows/ci.yml`) runs in two tiers:
+
+- **fast — every push to `main` and every pull request**: gofmt/vet → Linux
+  test matrix (race + coverage) → the weak-network benchmark, which fails the
+  run unless every seeded profile delivers 100% of the payload with a fully
+  drained ARQ.
+- **full — `v*` tag pushes and manual runs (release gating)**: adds the 3-OS
+  test matrix → benchmark smoke → cross builds (including android/arm64 and
+  the 32-bit alignment guards) → **the Android emulator job runs the
+  ping-socket carrier tests on a real Android kernel** → 32-bit execution and
+  fuzz smoke under QEMU.
+
 Pushing a `v*` tag builds and publishes a release automatically
 (`release.yml`).
 
