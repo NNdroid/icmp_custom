@@ -396,6 +396,10 @@ func BenchmarkSessionPollLoop(b *testing.B) {
 	sess := &clientSession{
 		client: &Client{
 			tr: ep, magic: MagicDefault, maxRecordSize: 2048, logger: Nop{},
+			// The poller is normally resolved once by NewClientWithTransport;
+			// this hand-built client must supply it the same way, or pollLoop
+			// sees a datagram carrier and never polls at all.
+			poller: ep,
 			cfg: ClientConfig{
 				PollInterval: time.Nanosecond, IdlePollInterval: time.Hour, KeepAlive: 2 * time.Hour,
 			},

@@ -262,8 +262,11 @@ jobs:
   test-32bit:
     name: Test on 32-bit (${{ matrix.goarch }} via QEMU)
     needs: lint
-    # the cost.
-    runs-on: ubuntu-latest
+    # Pinned to 24.04 on purpose: ubuntu-latest rolled to 26.04 (resolute),
+    # where the qemu-user-static package no longer exists ("no installation
+    # candidate"). 24.04 still ships it, which keeps the -exec '<qemu>-static'
+    # invocations below unchanged.
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
